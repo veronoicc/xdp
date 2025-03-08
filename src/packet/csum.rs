@@ -1,478 +1,582 @@
-//! Utitlities for calculating [internet checksums](https://en.wikipedia.org/wiki/Internet_checksum)
+#![allow(non_camel_case_types)]
 
-/// Folds a running checksum calculation to a 16-bit value appropriate for use
-/// in a checksum field
-#[inline]
-pub fn fold_checksum(mut csum: u32) -> u16 {
-    csum = (csum & 0xffff) + (csum >> 16);
-    csum = (csum & 0xffff) + (csum >> 16);
-    !csum as u16
-}
+use crate::{libc::socket, packet::Pod};
+use std::{
+    io::{Error, ErrorKind, Result},
+    mem,
+    os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
+};
 
-/// Converts a running checksum calculation to a 16-bit checksum appropriate
-/// for setting in a checksum field
-#[inline]
-pub fn to_u16(mut csum: u32) -> u16 {
-    csum = csum.overflowing_add(csum.rotate_left(16)).0;
-    (csum >> 16) as u16
-}
-
-/// Add with carry
-#[inline]
-pub fn add(mut a: u32, b: u32) -> u32 {
-    // SAFETY: asm
-    unsafe {
-        std::arch::asm!(
-            "addl {b:e}, {a:e}",
-            "adcl $0, {a:e}",
-            a = inout(reg) a,
-            b = in(reg) b,
-        );
-    }
-
-    a
-}
-
-/// Subtract with carry
-#[inline]
-pub fn sub(a: u32, b: u32) -> u32 {
-    add(a, !b)
-}
-
-/// Equivalent of [`bpf_csum_diff`](https://docs.ebpf.io/linux/helper-function/bpf_csum_diff/)
+/// Types for [`nlmsghdr::nlmsg_type`]
 ///
-/// This method allows adding and/or removing bytes in a running checksum calculation
-/// so that the entirety of the checksum doesn't need to be recalculated
-#[inline]
-pub fn diff(from: &[u8], to: &[u8], seed: u32) -> u16 {
-    let ret = if !from.is_empty() && !to.is_empty() {
-        let mut a = 0;
-        let mut b = 0;
-        std::thread::scope(|s| {
-            s.spawn(|| a = partial(to, seed));
-            s.spawn(|| b = partial(from, 0));
-        });
-        sub(a, b)
-    } else if !to.is_empty() {
-        partial(to, seed)
-    } else if !from.is_empty() {
-        !partial(from, !seed)
-    } else {
-        seed
+/// <include/uapi/linux/netlink.h>
+mod msg_kind {
+    pub type Enum = u16;
+
+    //pub const NOOP: Enum = 1;
+    pub const ERROR: Enum = 2;
+    pub const DONE: Enum = 3;
+    //pub const OVERRUN: Enum = 4;
+
+    pub const GENL_ID_CTRL: Enum = 0x10;
+}
+
+/// Flags for [`nlmsghdr::nlmsg_flags`]
+///
+/// <include/uapi/linux/netlink.h>>
+mod msg_flags {
+    pub type Enum = u16;
+
+    /// It is a request message
+    pub const REQUEST: Enum = 0x01;
+    // Multipart message, terminated by [`msg_kind::DONE`]
+    pub const MULTI: Enum = 0x02;
+
+    /// Extended ACK TVLs were included
+    pub const ACK_TLVS: Enum = 0x200;
+
+    pub const NESTED: Enum = 1 << 15;
+    pub const NET_BYTEORDER: Enum = 1 << 14;
+
+    pub const TYPE_MASK: Enum = !(NESTED | NET_BYTEORDER);
+}
+
+/// Generic netlink constants
+///
+/// <include/uapi/linux/genetlink.h>
+mod generic {
+    pub const CTRL_CMD_GETFAMILY: u8 = 3;
+
+    pub const CTRL_ATTR_FAMILY_ID: u16 = 1;
+    pub const CTRL_ATTR_FAMILY_NAME: u16 = 2;
+}
+
+/// netdev constants
+///
+/// <include/uapi/linux/netdev.h>
+mod netdev {
+    pub const NETDEV_CMD_DEV_GET: u8 = 1;
+
+    pub const NETDEV_A_DEV_IFINDEX: u16 = 1;
+    pub const NETDEV_A_DEV_XDP_FEATURES: u16 = 3;
+    pub const NETDEV_A_DEV_XDP_ZC_MAX_SEGS: u16 = 4;
+    pub const NETDEV_A_DEV_XDP_RX_METADATA_FEATURES: u16 = 5;
+    pub const NETDEV_A_DEV_XSK_FEATURES: u16 = 6;
+}
+
+const GENL_VERSION: u8 = 2;
+const NETLINK_EXT_ACK: i32 = 11;
+const NLMSGERR_ATTR_MSG: u16 = 1;
+
+macro_rules! len {
+    ($record:ty) => {
+        // SAFETY: internal only
+        unsafe impl Pod for $record {}
+
+        impl $record {
+            /// The length in bytes of this type
+            const LEN: usize = mem::size_of::<$record>();
+        }
     };
-
-    to_u16(ret)
 }
 
-/// Reduces the intermediate 64-bit sum to 32-bits that can be fed into
-/// further calculations
+#[repr(C)]
+struct sockaddr_nl {
+    nl_family: u16,
+    nl_pad: u16,
+    nl_pid: u32,
+    nl_groups: u32,
+}
+
+/// Fixed format metadata header of Netlink messages
+#[repr(C)]
+struct nlmsghdr {
+    /// Length of message including header
+    nlmsg_len: u32,
+    /// Message content type
+    nlmsg_type: msg_kind::Enum,
+    /// Additional flags
+    nlmsg_flags: msg_flags::Enum,
+    /// Sequence number
+    nlmsg_seq: u32,
+    /// Sending process port ID
+    nlmsg_pid: u32,
+}
+
+len!(nlmsghdr);
+
+/// netlink uses 4 byte alignment
 #[inline]
-fn finalize(sum: u64) -> u32 {
-    (sum.overflowing_add(sum.rotate_right(32)).0 >> 32) as u32
+const fn align(len: usize) -> usize {
+    (len + 3) & !3
 }
 
-/// Calculates the internet checksum for the specified block of bytes, appending
-/// it to the previous checksum calculation
-pub fn partial(mut buf: &[u8], sum: u32) -> u32 {
-    // TODO: https://fenrus75.github.io/csum_partial/ has some more potential
-    // wins, but that can be done later
-    // TODO: https://stackoverflow.com/questions/78889987/how-to-perform-parallel-addition-using-avx-with-carry-overflow-fed-back-into-t
-    // has a potential way to do it in SIMD which should be even better
+/// Generic netlink metadata header
+#[repr(C)]
+struct genlmsghdr {
+    cmd: u8,
+    version: u8,
+    __reserved: u16,
+}
+
+len!(genlmsghdr);
+
+#[repr(C)]
+struct nlattr {
+    nla_len: u16,
+    nla_type: u16,
+}
+
+len!(nlattr);
+
+#[repr(C)]
+struct nlmsgerr {
+    /// The error code, 0 for no error
+    error: i32,
+    /// The original request
+    msg: nlmsghdr,
+}
+
+len!(nlmsgerr);
+
+struct Buf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> Buf<N> {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: [0u8; N],
+            len: 0,
+        }
+    }
 
     #[inline]
-    fn update_40(mut sum: u64, bytes: &[u8]) -> u64 {
-        debug_assert_eq!(bytes.len(), 40);
+    fn read<P: Pod>(&self, off: &mut usize) -> Result<P> {
+        if *off > N || *off + P::size() > self.len {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "received incomplete netlink packet",
+            ));
+        }
 
-        // SAFETY: asm
+        let p =
+            // SAFETY: we've validated we'll only read within bounds
+            unsafe { std::ptr::read_unaligned(self.buf.as_ptr().byte_offset(*off as _).cast()) };
+        *off += P::size();
+        Ok(p)
+    }
+
+    #[inline]
+    fn write<P: Pod>(&mut self, off: &mut usize, item: P) -> Result<()> {
+        assert!(
+            *off < N && *off + P::size() <= self.len,
+            "this indicates a bug in the netlink code, please file an issue"
+        );
+
+        // SAFETY: we've validated we'll only write within bounds
         unsafe {
-            std::arch::asm!(
-                "addq 0*8({buf}), {sum}",
-                "adcq 1*8({buf}), {sum}",
-                "adcq 2*8({buf}), {sum}",
-                "adcq 3*8({buf}), {sum}",
-                "adcq 4*8({buf}), {sum}",
-                "adcq $0, {sum}",
-                buf = in(reg) bytes.as_ptr(),
-                sum = inout(reg) sum,
-                options(att_syntax)
+            std::ptr::write_unaligned(self.buf.as_mut_ptr().byte_offset(*off as _).cast(), item);
+        };
+        *off += P::size();
+        Ok(())
+    }
+
+    #[inline]
+    fn push<P: Pod>(&mut self, data: P) -> Result<()> {
+        if self.len + P::size() > N {
+            return Err(Error::new(
+                ErrorKind::OutOfMemory,
+                "unable to append data to buffer, it would overflow",
+            ));
+        }
+
+        self.buf[self.len..self.len + P::size()].copy_from_slice(data.as_bytes());
+        self.len += P::size();
+        Ok(())
+    }
+
+    #[inline]
+    fn push_attribute(&mut self, kind: u16, data: &[u8]) -> Result<()> {
+        let tail = align(self.len);
+        if tail + align(nlattr::LEN + data.len()) > N {
+            return Err(Error::new(
+                ErrorKind::OutOfMemory,
+                "unable to append attribute to buffer, it would overflow",
+            ));
+        }
+
+        let attr_len = {
+            let attr_len = nlattr::LEN + data.len();
+
+            self.len = tail;
+            self.push(nlattr {
+                nla_type: kind,
+                nla_len: attr_len as u16,
+            })?;
+            self.buf[self.len..self.len + data.len()].copy_from_slice(data);
+
+            attr_len
+        };
+
+        self.len = tail + align(attr_len);
+        Ok(())
+    }
+}
+
+struct AttrIter<'b, const N: usize> {
+    buf: &'b Buf<N>,
+    off: &'b mut usize,
+    len: usize,
+}
+
+impl<'b, const N: usize> AttrIter<'b, N> {
+    fn generic(buf: &'b Buf<N>, msg_hdr: &nlmsghdr, off: &'b mut usize) -> Result<Self> {
+        let _gen_hdr = buf.read::<genlmsghdr>(off)?;
+        *off = align(*off);
+        let len = msg_hdr.nlmsg_len as usize - align(genlmsghdr::LEN) - nlmsghdr::LEN;
+
+        Ok(Self { buf, off, len })
+    }
+
+    fn error(buf: &'b Buf<N>, msg_hdr: &nlmsghdr, _err_msg: &nlmsgerr, off: &'b mut usize) -> Self {
+        let len = msg_hdr.nlmsg_len as usize - align(nlmsgerr::LEN) - nlmsghdr::LEN;
+        Self { buf, off, len }
+    }
+}
+
+impl<'b, const N: usize> Iterator for AttrIter<'b, N> {
+    type Item = (u16, &'b [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.len < nlattr::LEN {
+            return None;
+        }
+
+        let mut off = *self.off;
+        let attr = self.buf.read::<nlattr>(&mut off).ok()?;
+        let kind = attr.nla_type & msg_flags::TYPE_MASK;
+        let tot_len = align(attr.nla_len as usize);
+        let data_len = attr.nla_len as usize - nlattr::LEN;
+
+        if tot_len > self.len {
+            return None;
+        }
+
+        let data = &self.buf.buf[off..off + data_len];
+
+        self.len -= tot_len;
+        *self.off += tot_len;
+
+        Some((kind, data))
+    }
+}
+
+impl<const N: usize> Drop for AttrIter<'_, N> {
+    fn drop(&mut self) {
+        *self.off += self.len;
+    }
+}
+
+macro_rules! io_err {
+    ($val:expr) => {{
+        if $val < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        $val as _
+    }};
+}
+
+struct NetlinkSocket {
+    sock: OwnedFd,
+    seq: u32,
+}
+
+impl NetlinkSocket {
+    fn send_and_recv<const N: usize, T>(
+        &mut self,
+        msg: &mut Buf<N>,
+        func: impl Fn(AttrIter<'_, N>) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        let seq = self.seq;
+        self.seq += 1;
+
+        // SAFETY: various syscalls and buffer manipulation
+        unsafe {
+            let mut off = 0;
+            let len = msg.len;
+
+            let mut hdr = msg.read::<nlmsghdr>(&mut off)?;
+            off = 0;
+            hdr.nlmsg_seq = seq;
+            hdr.nlmsg_len = len as _;
+            msg.write(&mut off, hdr)?;
+
+            let sent: usize = io_err!(socket::send(
+                self.sock.as_raw_fd(),
+                msg.buf.as_ptr().cast(),
+                msg.len,
+                socket::MsgFlags::NONE
+            ));
+
+            if sent != msg.len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::FileTooLarge,
+                    "failed to send full nlmsg",
+                ));
+            }
+
+            let mut is_multi_part = true;
+
+            while is_multi_part {
+                msg.len = io_err!(socket::recv(
+                    self.sock.as_raw_fd(),
+                    msg.buf.as_mut_ptr().cast(),
+                    N,
+                    socket::MsgFlags::NONE
+                ));
+                is_multi_part = false;
+
+                let mut offset = 0;
+                while offset < msg.len {
+                    let msg_hdr = msg.read::<nlmsghdr>(&mut offset)?;
+                    if msg_hdr.nlmsg_flags & msg_flags::MULTI != 0 {
+                        is_multi_part = true;
+                    }
+
+                    if msg_hdr.nlmsg_seq != seq {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "invalid sequence in netlink response",
+                        ));
+                    }
+
+                    match msg_hdr.nlmsg_type {
+                        msg_kind::ERROR => {
+                            let err_hdr = msg.read::<nlmsgerr>(&mut offset)?;
+                            if err_hdr.error != 0 {
+                                // Query if the message has extended error information
+                                let message = if msg_hdr.nlmsg_flags & msg_flags::ACK_TLVS != 0 {
+                                    // We could also recover the offset of the failing attribute, but considering
+                                    // we only do 2 requests and both have a single attribute..
+                                    AttrIter::error(msg, &msg_hdr, &err_hdr, &mut offset).find_map(|(kind, data)| {
+                                        (kind == NLMSGERR_ATTR_MSG).then_some(String::from_utf8_lossy(&data[..data.len() - 2]).into_owned())
+                                    }).unwrap_or_else(|| format!("received netlink error code {}, and we failed to retrieve the additional information provided by the kernel", err_hdr.error))
+                                } else {
+                                    format!(
+                                        "received netlink error code {}, and no additional error information was provided by the kernel",
+                                        err_hdr.error
+                                    )
+                                };
+
+                                return Err(Error::new(ErrorKind::ConnectionRefused, message));
+                            } else {
+                                offset = align(msg_hdr.nlmsg_len as usize);
+                            }
+                        }
+                        msg_kind::DONE => {
+                            return Ok(None);
+                        }
+                        _other => {
+                            let res = func(AttrIter::generic(msg, &msg_hdr, &mut offset)?)?;
+                            if res.is_some() {
+                                return Ok(res);
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(None)
+        }
+    }
+}
+
+macro_rules! read_attr {
+    ($kind:ty, $attr:expr) => {{
+        if $attr.len() != std::mem::size_of::<$kind>() {
+            None
+        } else {
+            let mut bytes = [0u8; std::mem::size_of::<$kind>()];
+            bytes.copy_from_slice($attr);
+            Some(<$kind>::from_ne_bytes(bytes))
+        }
+    }};
+}
+
+impl super::NicIndex {
+    pub(super) fn netdev_caps(&self) -> std::io::Result<super::NetdevCapabilities> {
+        // SAFETY: We validate the socket descriptor
+        let mut socket = unsafe {
+            let fd = socket::socket(
+                socket::AddressFamily::AF_NETLINK,
+                socket::Kind::SOCK_RAW,
+                socket::Protocol::NETLINK_GENERIC,
             );
-        }
 
-        sum
-    }
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
 
-    let mut sum = sum as u64;
+            NetlinkSocket {
+                sock: OwnedFd::from_raw_fd(fd),
+                seq: 0xfeedfeed,
+            }
+        };
 
-    if buf.len() >= 80 {
-        let mut sum2 = 0;
-        while buf.len() >= 80 {
-            sum = update_40(sum, &buf[..40]);
-            sum2 = update_40(sum2, &buf[40..80]);
-            buf = &buf[80..];
-        }
-
-        // SAFETY: asm
+        // SAFETY: POD + we give a valid sockaddr to bind
         unsafe {
-            std::arch::asm!(
-                "addq {0}, {sum}",
-                "adcq $0, {sum}",
-                in(reg) sum2,
-                sum = inout(reg) sum,
-                options(att_syntax)
+            // Enable extended ack, which can give use more detail error information
+            let enable = 1;
+            socket::setsockopt(
+                socket.sock.as_raw_fd(),
+                socket::Level::SOL_NETLINK,
+                NETLINK_EXT_ACK,
+                (&enable as *const i32).cast(),
+                mem::size_of_val(&enable) as _,
             );
-        }
-    }
 
-    if buf.len() >= 40 {
-        sum = update_40(sum, &buf[..40]);
-        buf = &buf[40..];
+            let mut nladdr = mem::zeroed::<sockaddr_nl>();
+            nladdr.nl_family = socket::AddressFamily::AF_NETLINK as _;
 
-        if buf.is_empty() {
-            return finalize(sum);
-        }
-    }
-
-    let len = buf.len();
-    if len & 32 != 0 {
-        // SAFETY: asm
-        unsafe {
-            std::arch::asm!(
-                "addq 0*8({buf}), {sum}",
-                "adcq 1*8({buf}), {sum}",
-                "adcq 2*8({buf}), {sum}",
-                "adcq 3*8({buf}), {sum}",
-                "adcq $0, {sum}",
-                buf = in(reg) buf.as_ptr(),
-                sum = inout(reg) sum,
-                options(att_syntax)
-            );
+            if socket::bind(
+                socket.sock.as_raw_fd(),
+                (&nladdr as *const sockaddr_nl).cast(),
+                mem::size_of::<sockaddr_nl>() as u32,
+            ) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
         }
 
-        buf = &buf[32..];
-    }
+        // Just use the same buffer for sends and receives
+        let mut buf = Buf::<{ 2 * 1024 }>::new();
 
-    if len & 16 != 0 {
-        // SAFETY: asm
-        unsafe {
-            std::arch::asm!(
-                "addq 0*8({buf}), {sum}",
-                "adcq 1*8({buf}), {sum}",
-                "adcq $0, {sum}",
-                buf = in(reg) buf.as_ptr(),
-                sum = inout(reg) sum,
-                options(att_syntax)
-            );
-        }
+        // Resolve the netdev family, this is mapping a friendly string to an integer id
+        let netdev_id = {
+            buf.push(nlmsghdr {
+                nlmsg_len: 0,
+                nlmsg_type: msg_kind::GENL_ID_CTRL,
+                nlmsg_flags: msg_flags::REQUEST,
+                nlmsg_seq: 0,
+                nlmsg_pid: 0,
+            })?;
+            buf.push(genlmsghdr {
+                cmd: generic::CTRL_CMD_GETFAMILY,
+                version: GENL_VERSION,
+                __reserved: 0,
+            })?;
 
-        buf = &buf[16..];
-    }
+            // This is the attribute which informs netlink which family id we are querying
+            buf.push_attribute(generic::CTRL_ATTR_FAMILY_NAME, b"netdev\0")?;
 
-    if len & 8 != 0 {
-        // SAFETY: asm
-        unsafe {
-            std::arch::asm!(
-                "addq 0*8({buf}), {sum}",
-                "adcq $0, {sum}",
-                buf = in(reg) buf.as_ptr(),
-                sum = inout(reg) sum,
-                options(att_syntax)
-            );
-        }
+            socket
+                .send_and_recv(&mut buf, |attrs| -> Result<Option<u16>> {
+                    for (attr, data) in attrs {
+                        if attr != generic::CTRL_ATTR_FAMILY_ID {
+                            continue;
+                        }
 
-        buf = &buf[8..];
-    }
+                        let Some(id) = read_attr!(u16, data) else {
+                            return Err(Error::new(
+                                ErrorKind::InvalidData,
+                                "unexpected size for `netdev` CTRL_ATTR_FAMILY_ID",
+                            ));
+                        };
 
-    if len & 7 != 0 {
-        // Calculate the shift we use to keep only the remaining bytes instead
-        // of the whole u64
-        let shift = ((-(len as i64) << 3) & 63) as u32;
+                        return Ok(Some(id));
+                    }
 
-        // SAFETY: asm
-        unsafe {
-            // The kernel's load_unaligned_zeropad needs to take into account
-            // this load potentially crossing page boundaries, but we don't have
-            // that problem because Umem chunks can't be larger than a page, nor
-            // do we support unaligned chunks
-            let trail = {
-                let mut ual: u64;
-                std::arch::asm!(
-                    "movq 0*8({buf}), {ual}",
-                    buf = in(reg) buf.as_ptr(),
-                    ual = out(reg) ual,
-                    options(att_syntax)
-                );
+                    Ok(None)
+                })?
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::NotFound,
+                        "failed to resolve the `netdev` family id",
+                    )
+                })?
+        };
 
-                (ual << shift) >> shift
+        // Now we can query the netdev to get the supported xdp features
+        buf.len = 0;
+        buf.push(nlmsghdr {
+            nlmsg_len: 0,
+            nlmsg_type: netdev_id,
+            nlmsg_flags: msg_flags::REQUEST,
+            nlmsg_seq: 0,
+            nlmsg_pid: 0,
+        })?;
+        buf.push(genlmsghdr {
+            cmd: netdev::NETDEV_CMD_DEV_GET,
+            version: GENL_VERSION,
+            __reserved: 0,
+        })?;
+
+        // This is the attribute used to tell netlink this is the interface index we wish to query
+        buf.push_attribute(netdev::NETDEV_A_DEV_IFINDEX, &self.0.to_ne_bytes())?;
+
+        let caps = socket.send_and_recv(&mut buf, |attrs| {
+            let mut xdp_features = None;
+            let mut zero_copy_max_segs = None;
+            let mut rx_metadata_features = None;
+            let mut xsk_features = None;
+
+            for (attr, data) in attrs {
+                match attr {
+                    netdev::NETDEV_A_DEV_IFINDEX => {
+                        let Some(ifindex) = read_attr!(u32, data) else {
+                            return Ok(None);
+                        };
+                        if ifindex != self.0 {
+                            return Ok(None);
+                        }
+                    }
+                    netdev::NETDEV_A_DEV_XDP_FEATURES => {
+                        let Some(xdp_feats) = read_attr!(u64, data) else {
+                            return Ok(None);
+                        };
+                        xdp_features = Some(xdp_feats);
+                    }
+                    netdev::NETDEV_A_DEV_XSK_FEATURES => {
+                        xsk_features = read_attr!(u64, data);
+                    }
+                    netdev::NETDEV_A_DEV_XDP_RX_METADATA_FEATURES => {
+                        rx_metadata_features = read_attr!(u64, data);
+                    }
+                    netdev::NETDEV_A_DEV_XDP_ZC_MAX_SEGS => {
+                        zero_copy_max_segs = read_attr!(u32, data);
+                    }
+                    _ => {}
+                }
+            }
+
+            let Some(xdp_features) = xdp_features else {
+                return Ok(None);
             };
 
-            std::arch::asm!(
-                "addq {trail}, {sum}",
-                "adcq $0, {sum}",
-                trail = in(reg) trail,
-                sum = inout(reg) sum,
-                options(att_syntax)
-            );
-        }
-    }
-
-    finalize(sum)
-}
-
-use crate::packet::net_types as nt;
-
-/// Errors that can occur during UDP checksum calculation
-#[derive(Debug)]
-pub enum UdpCalcError {
-    /// Not an IP packet
-    NotIp(nt::EtherType::Enum),
-    /// Not a UDP packet
-    NotUdp(nt::IpProto::Enum),
-    /// Packet data was invalid/corrupt
-    Packet(super::PacketError),
-}
-
-use std::fmt;
-
-impl fmt::Display for UdpCalcError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotIp(et) => {
-                write!(f, "not an IP packet, but a {et:?}")
-            }
-            Self::NotUdp(proto) => {
-                write!(f, "not a UDP packet, but a {proto:?}")
-            }
-            Self::Packet(fe) => {
-                write!(f, "failed to parse packet: {fe}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for UdpCalcError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Packet(fe) => Some(fe),
-            _ => None,
-        }
-    }
-}
-
-impl From<super::PacketError> for UdpCalcError {
-    #[inline]
-    fn from(value: super::PacketError) -> Self {
-        Self::Packet(value)
-    }
-}
-
-impl super::Packet {
-    /// Performs a full calculation of the UDP header checksum.
-    ///
-    /// This method is here for convenience, but it might be better in some
-    /// scenarios to use a running checksum calculation like [`partial`] or [`diff`]
-    ///
-    /// This method takes TX checksum offload into account, and will only
-    /// calculate the partial (pseudo header + UDP header) checksum, and configure
-    /// the TX metadata for the packet so that the data checksum will be calculated
-    /// by the NIC that sends the packet
-    pub fn calc_udp_checksum(&mut self) -> Result<u16, UdpCalcError> {
-        use crate::packet::Pod as _;
-        use nt::*;
-
-        let mut offset = 0;
-        let eth = self.read::<EthHdr>(offset)?;
-        offset += EthHdr::LEN;
-
-        let (pseudo_seed, mut udp_hdr) = match eth.ether_type {
-            EtherType::Ipv4 => {
-                let ipv4 = self.read::<Ipv4Hdr>(offset)?;
-                debug_assert_eq!(
-                    ipv4.internet_header_length(),
-                    Ipv4Hdr::LEN as u8,
-                    "ipv4 options are not supported"
-                );
-                offset += Ipv4Hdr::LEN;
-
-                if ipv4.proto != IpProto::Udp {
-                    return Err(UdpCalcError::NotUdp(ipv4.proto));
-                }
-
-                let udp_hdr = self.read::<UdpHdr>(offset)?;
-
-                // https://en.wikipedia.org/wiki/User_Datagram_Protocol#IPv4_pseudo_header
-                // SAFETY: asm
-                unsafe {
-                    let mut sum = 0;
-
-                    std::arch::asm!(
-                        "addl {saddr:e}, {sum:e}",
-                        "adcl {daddr:e}, {sum:e}",
-                        "adcl {pseudo:e}, {sum:e}",
-                        "adcl $0, {sum:e}",
-                        saddr = in(reg) ipv4.source.0,
-                        daddr = in(reg) ipv4.destination.0,
-                        pseudo = in(reg) (udp_hdr.length.host() as u32 + IpProto::Udp as u32) << 8,
-                        sum = inout(reg) sum,
-                        options(att_syntax)
-                    );
-
-                    (sum, udp_hdr)
-                }
-            }
-            EtherType::Ipv6 => {
-                let ipv6 = self.read::<Ipv6Hdr>(offset)?;
-                offset += Ipv6Hdr::LEN;
-
-                if ipv6.next_header != IpProto::Udp {
-                    return Err(UdpCalcError::NotUdp(ipv6.next_header));
-                }
-
-                let udp_hdr = self.read::<UdpHdr>(offset)?;
-
-                // https://en.wikipedia.org/wiki/User_Datagram_Protocol#IPv6_pseudo_header
-                // SAFETY: asm
-                unsafe {
-                    let mut sum = ((udp_hdr.length.host() as u32).to_be() as u64)
-                        .wrapping_add((IpProto::Udp as u64).to_be());
-
-                    std::arch::asm!(
-                        "addq 0*8({saddr}), {sum}",
-                        "adcq 1*8({saddr}), {sum}",
-                        "adcq 0*8({daddr}), {sum}",
-                        "adcq 1*8({daddr}), {sum}",
-                        "adcq $0, {sum}",
-                        saddr = in(reg) ipv6.source.as_ptr(),
-                        daddr = in(reg) ipv6.destination.as_ptr(),
-                        sum = inout(reg) sum,
-                        options(att_syntax)
-                    );
-
-                    (finalize(sum), udp_hdr)
-                }
-            }
-            invalid => return Err(UdpCalcError::NotIp(invalid)),
-        };
-
-        let checksum = if self.can_offload_checksum() {
-            let csum = fold_checksum(pseudo_seed);
-            udp_hdr.check = !csum;
-            self.write(offset, udp_hdr)?;
-
-            self.set_tx_metadata(
-                crate::packet::CsumOffload::Request {
-                    start: offset as u16,
-                    offset: std::mem::offset_of!(UdpHdr, check) as u16,
+            Ok(Some(super::NetdevCapabilities {
+                queue_count: 0,
+                zero_copy: match zero_copy_max_segs.unwrap_or(0) {
+                    0 => super::XdpZeroCopy::Unavailable,
+                    1 => super::XdpZeroCopy::Available,
+                    o => super::XdpZeroCopy::MultiBuffer(o),
                 },
-                false,
-            )?;
+                xdp_features: super::XdpFeatures(xdp_features),
+                rx_metadata: super::XdpRxMetadata(rx_metadata_features.unwrap_or(0)),
+                tx_metadata: super::XdpTxMetadata(xsk_features.unwrap_or(0)),
+            }))
+        })?;
 
-            csum
-        } else {
-            udp_hdr.check = 0;
-            let sum = partial(udp_hdr.as_bytes(), pseudo_seed);
-
-            let data_offset = offset + nt::UdpHdr::LEN;
-            let data_payload = &self[data_offset..self.len()];
-
-            let mut csum = fold_checksum(partial(data_payload, sum));
-
-            // If the checksum calculation results in the value zero (all 16 bits 0)
-            // it should be sent as the ones' complement (all 1s) as a zero-value
-            // checksum indicates no checksum has been calculated.[7] In this case,
-            // any specific processing is not required at the receiver, because all
-            // 0s and all 1s are equal to zero in 1's complement arithmetic.
-            if csum == 0 {
-                csum = 0xffff;
-            }
-
-            udp_hdr.check = csum;
-
-            self.write(offset, udp_hdr)?;
-
-            csum
+        let Some(caps) = caps else {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "failed to query XDP features",
+            ));
         };
 
-        Ok(checksum)
-    }
-}
-
-impl nt::UdpHeaders {
-    /// Given an already calculated checksum for the data payload, or 0 if using
-    /// tx checksum offload, checksums the pseudo IP and UDP header
-    #[inline]
-    pub fn calc_checksum(&mut self, length: usize, data_checksum: u32) -> u16 {
-        self.data_length = length;
-
-        let mut sum = data_checksum as u64;
-        let data_len = self.data_length + nt::UdpHdr::LEN;
-
-        match &self.ip {
-            nt::IpHdr::V4(v4) => {
-                // https://en.wikipedia.org/wiki/User_Datagram_Protocol#IPv4_pseudo_header
-                // SAFETY: asm
-                unsafe {
-                    std::arch::asm!(
-                        "addq {pseudo_udp}, {sum}",
-                        "adcq {saddr}, {sum}",
-                        "adcq {daddr}, {sum}",
-                        "adcq 0*8({udp}), {sum}",
-                        "adcq $0, {sum}",
-                        pseudo_udp = in(reg) ((data_len + nt::IpProto::Udp as usize) as u64).to_be(),
-                        saddr = in(reg) (v4.source.host() as u64).to_be(),
-                        daddr = in(reg) (v4.destination.host() as u64).to_be(),
-                        udp = in(reg) &nt::UdpHdr {
-                            source: self.udp.source,
-                            destination: self.udp.destination,
-                            length: (data_len as u16).into(),
-                            check: 0,
-                        },
-                        sum = inout(reg) sum,
-                        options(att_syntax)
-                    );
-                }
-            }
-            nt::IpHdr::V6(v6) => {
-                // https://en.wikipedia.org/wiki/User_Datagram_Protocol#IPv6_pseudo_header
-                // SAFETY: asm
-                unsafe {
-                    let source = v6.source;
-                    let destination = v6.destination;
-
-                    std::arch::asm!(
-                        "addq {pseudo_udp}, {sum}",
-                        "adcq 0*8({saddr}), {sum}",
-                        "adcq 1*8({saddr}), {sum}",
-                        "adcq 0*8({daddr}), {sum}",
-                        "adcq 1*8({daddr}), {sum}",
-                        "adcq 0*8({udp}), {sum}",
-                        "adcq $0, {sum}",
-                        pseudo_udp = in(reg) ((data_len + nt::IpProto::Udp as usize) as u64).to_be(),
-                        saddr = in(reg) source.as_ptr(),
-                        daddr = in(reg) destination.as_ptr(),
-                        udp = in(reg) &nt::UdpHdr {
-                            source: self.udp.source,
-                            destination: self.udp.destination,
-                            length: (data_len as u16).into(),
-                            check: 0,
-                        },
-                        sum = inout(reg) sum,
-                        options(att_syntax)
-                    );
-                }
-            }
-        }
-
-        self.udp.check = fold_checksum(finalize(sum));
-
-        // If the checksum calculation results in the value zero (all 16 bits 0)
-        // it should be sent as the ones' complement (all 1s) as a zero-value
-        // checksum indicates no checksum has been calculated.[7] In this case,
-        // any specific processing is not required at the receiver, because all
-        // 0s and all 1s are equal to zero in 1's complement arithmetic.
-        if self.udp.check == 0 {
-            self.udp.check = 0xffff;
-        }
-
-        self.udp.check
+        Ok(caps)
     }
 }
