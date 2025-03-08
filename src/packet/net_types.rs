@@ -1,6 +1,3 @@
-//! This is a minimal set of type definitions/helpers for common network types,
-//! so one does not need to depend on eg. network-types which lacks comments
-
 use super::{Pod, csum};
 use std::{
     fmt,
@@ -333,6 +330,70 @@ impl fmt::Debug for UdpHdr {
             .field("destination", &self.destination)
             .field("length", &self.length)
             .field("check", &format_args!("{:04x}", self.check))
+            .finish()
+    }
+}
+
+/// The [TCP](https://en.wikipedia.org/wiki/Transmission_Control_Protocol) header
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct TcpHdr {
+    /// The source port of the sender
+    pub source: NetworkU16,
+    /// The destination port
+    pub destination: NetworkU16,
+    /// The sequence number of the first byte in the TCP segment
+    pub sequence_number: NetworkU32,
+    /// The acknowledgment number indicating the next expected byte from the sender
+    pub acknowledgment_number: NetworkU32,
+    /// The size of the TCP header in 32-bit words
+    pub data_offset: u8,
+    /// Control flags such as SYN, ACK, FIN, etc.
+    pub flags: u8,
+    /// The size of the sender's receive window
+    pub window_size: NetworkU16,
+    /// The checksum for error-checking the TCP header and data
+    pub checksum: u16,
+    /// If the URG flag is set, this field indicates the offset from the sequence number where the urgent data ends
+    pub urgent_pointer: NetworkU16,
+    /// Options
+    pub options: [u8; 0],
+}
+
+len!(TcpHdr);
+
+impl TcpHdr {
+    /// Returns a new [`Self`] with the source and destination ports swapped
+    #[inline]
+    pub fn swapped(&self) -> Self {
+        Self {
+            source: self.destination,
+            destination: self.source,
+            sequence_number: self.sequence_number,
+            acknowledgment_number: self.acknowledgment_number,
+            data_offset: self.data_offset,
+            flags: self.flags,
+            window_size: self.window_size,
+            checksum: self.checksum,
+            urgent_pointer: self.urgent_pointer,
+            options: [],
+        }
+    }
+}
+
+#[cfg(feature = "__debug")]
+impl fmt::Debug for TcpHdr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TcpHdr")
+            .field("source", &self.source)
+            .field("destination", &self.destination)
+            .field("sequence_number", &self.sequence_number)
+            .field("acknowledgment_number", &self.acknowledgment_number)
+            .field("data_offset", &self.data_offset)
+            .field("flags", &self.flags)
+            .field("window_size", &self.window_size)
+            .field("checksum", &format_args!("{:04x}", self.checksum))
+            .field("urgent_pointer", &self.urgent_pointer)
             .finish()
     }
 }
@@ -751,6 +812,277 @@ impl UdpHeaders {
         packet.write(offset, self.udp)?;
 
         Ok(())
+    }
+}
+
+/// A [TCP](https://en.wikipedia.org/wiki/Transmission_Control_Protocol) packet
+#[cfg_attr(feature = "__debug", derive(Debug))]
+pub struct TcpHeaders {
+    /// The data link layer header
+    pub eth: EthHdr,
+    /// The network header
+    pub ip: IpHdr,
+    /// The transport header
+    pub tcp: TcpHdr,
+    /// The offset from the beginning of the packet where the data payload begins
+    pub data_offset: usize,
+    /// The length of the data payload
+    pub data_length: usize,
+}
+
+impl TcpHeaders {
+    /// Attempts to parse a [`Self`] from a packet.
+    ///
+    /// Returns `Ok(None)` if the packet doesn't seem corrupted, but doesn't
+    /// actually contain a TCP packet, eg. it is not an IP packet, or has a
+    /// different transport layer protocol
+    ///
+    /// # Errors
+    ///
+    /// Errors in cases where the data can be partially parsed but the size of the
+    /// packet data indicates a corrupt/invalid packet
+    pub fn parse_packet(packet: &super::Packet) -> Result<Option<Self>, super::PacketError> {
+        let mut offset = 0;
+        let eth = packet.read::<EthHdr>(offset)?;
+        offset += EthHdr::LEN;
+
+        let ip = match eth.ether_type {
+            EtherType::Ipv4 => {
+                let ipv4 = packet.read::<Ipv4Hdr>(offset)?;
+                offset += Ipv4Hdr::LEN;
+
+                if ipv4.proto == IpProto::Tcp {
+                    IpHdr::V4(ipv4)
+                } else {
+                    return Ok(None);
+                }
+            }
+            EtherType::Ipv6 => {
+                let ipv6 = packet.read::<Ipv6Hdr>(offset)?;
+                offset += Ipv6Hdr::LEN;
+
+                if ipv6.next_header == IpProto::Tcp {
+                    IpHdr::V6(ipv6)
+                } else {
+                    return Ok(None);
+                }
+            }
+            _ => {
+                return Ok(None);
+            }
+        };
+
+        let tcp = packet.read::<TcpHdr>(offset)?;
+        let data_length = packet.len() - (offset + TcpHdr::LEN);
+
+        Ok(Some(Self {
+            eth,
+            ip,
+            tcp,
+            data_offset: offset + TcpHdr::LEN,
+            data_length,
+        }))
+    }
+
+    /// True if and IPv4 packet
+    #[inline]
+    pub fn is_ipv4(&self) -> bool {
+        matches!(&self.ip, IpHdr::V4(_))
+    }
+
+    /// The total length of the header segments before the data segment
+    #[inline]
+    pub fn header_length(&self) -> usize {
+        EthHdr::LEN
+            + if self.is_ipv4() {
+                Ipv4Hdr::LEN
+            } else {
+                Ipv6Hdr::LEN
+            }
+            + TcpHdr::LEN
+    }
+
+    /// Decrements the hop counter
+    #[inline]
+    pub fn decrement_hop(&mut self) -> u8 {
+        self.ip.decrement_hop()
+    }
+
+    /// Retrieves the source address information
+    #[inline]
+    pub fn source_address(&self) -> SocketAddr {
+        use std::net::*;
+
+        match self.ip {
+            IpHdr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from_bits(v4.source.host()),
+                self.tcp.source.host(),
+            )),
+            IpHdr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(
+                ipv6_addr_from_bytes(v6.source),
+                self.tcp.source.host(),
+                // we _could_ retrieve these from the header, but...meh
+                0,
+                0,
+            )),
+        }
+    }
+
+    /// Retrieves the destination address information
+    #[inline]
+    pub fn destination_address(&self) -> SocketAddr {
+        use std::net::*;
+
+        match self.ip {
+            IpHdr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from_bits(v4.destination.host()),
+                self.tcp.destination.host(),
+            )),
+            IpHdr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(
+                ipv6_addr_from_bytes(v6.destination),
+                self.tcp.destination.host(),
+                // we _could_ retrieve these from the header, but...meh
+                0,
+                0,
+            )),
+        }
+    }
+
+    /// Writes the headers to the front of the packet buffer.
+    ///
+    /// If `calculate_ipv4_checksum` is `true`, the IPv4 header checksum is
+    /// calculated, otherwise it is set to 0, as the IPv4 checksum is optional
+    /// for TCP packets
+    ///
+    /// # Errors
+    ///
+    /// The packet buffer must have enough space for all of the headers
+    pub fn set_packet_headers(
+        &mut self,
+        packet: &mut super::Packet,
+        calculate_ipv4_checksum: bool,
+    ) -> Result<(), super::PacketError> {
+        let mut offset = EthHdr::LEN;
+
+        let length = (self.data_length + TcpHdr::LEN) as u16;
+
+        self.eth.ether_type = match &mut self.ip {
+            IpHdr::V4(v4) => {
+                v4.total_length = (length + Ipv4Hdr::LEN as u16).into();
+                if calculate_ipv4_checksum {
+                    v4.calc_checksum();
+                } else {
+                    v4.check = 0;
+                }
+                packet.write(offset, *v4)?;
+                offset += Ipv4Hdr::LEN;
+                EtherType::Ipv4
+            }
+            IpHdr::V6(v6) => {
+                v6.payload_length = length.into();
+                packet.write(offset, *v6)?;
+                offset += Ipv6Hdr::LEN;
+                EtherType::Ipv6
+            }
+        };
+
+        packet.write(0, self.eth)?;
+
+        self.tcp.checksum = 0;
+        packet.write(offset, self.tcp)?;
+
+        Ok(())
+    }
+
+    /// Given an already calculated checksum for the data payload, or 0 if using
+    /// tx checksum offload, checksums the pseudo IP and TCP header
+    #[inline]
+    pub fn calc_checksum(&mut self, length: usize, data_checksum: u32) -> u16 {
+        self.data_length = length;
+
+        let mut sum = data_checksum as u64;
+        let data_len = self.data_length + TcpHdr::LEN;
+
+        match &self.ip {
+            IpHdr::V4(v4) => {
+                // https://en.wikipedia.org/wiki/Transmission_Control_Protocol#IPv4_pseudo_header
+                // SAFETY: asm
+                unsafe {
+                    std::arch::asm!(
+                        "addq {pseudo_tcp}, {sum}",
+                        "adcq {saddr}, {sum}",
+                        "adcq {daddr}, {sum}",
+                        "adcq 0*8({tcp}), {sum}",
+                        "adcq $0, {sum}",
+                        pseudo_tcp = in(reg) ((data_len + IpProto::Tcp as usize) as u64).to_be(),
+                        saddr = in(reg) (v4.source.host() as u64).to_be(),
+                        daddr = in(reg) (v4.destination.host() as u64).to_be(),
+                        tcp = in(reg) &TcpHdr {
+                            source: self.tcp.source,
+                            destination: self.tcp.destination,
+                            sequence_number: self.tcp.sequence_number,
+                            acknowledgment_number: self.tcp.acknowledgment_number,
+                            data_offset: self.tcp.data_offset,
+                            flags: self.tcp.flags,
+                            window_size: self.tcp.window_size,
+                            checksum: 0,
+                            urgent_pointer: self.tcp.urgent_pointer,
+                            options: [],
+                        },
+                        sum = inout(reg) sum,
+                        options(att_syntax)
+                    );
+                }
+            }
+            IpHdr::V6(v6) => {
+                // https://en.wikipedia.org/wiki/Transmission_Control_Protocol#IPv6_pseudo_header
+                // SAFETY: asm
+                unsafe {
+                    let source = v6.source;
+                    let destination = v6.destination;
+
+                    std::arch::asm!(
+                        "addq {pseudo_tcp}, {sum}",
+                        "adcq 0*8({saddr}), {sum}",
+                        "adcq 1*8({saddr}), {sum}",
+                        "adcq 0*8({daddr}), {sum}",
+                        "adcq 1*8({daddr}), {sum}",
+                        "adcq 0*8({tcp}), {sum}",
+                        "adcq $0, {sum}",
+                        pseudo_tcp = in(reg) ((data_len + IpProto::Tcp as usize) as u64).to_be(),
+                        saddr = in(reg) source.as_ptr(),
+                        daddr = in(reg) destination.as_ptr(),
+                        tcp = in(reg) &TcpHdr {
+                            source: self.tcp.source,
+                            destination: self.tcp.destination,
+                            sequence_number: self.tcp.sequence_number,
+                            acknowledgment_number: self.tcp.acknowledgment_number,
+                            data_offset: self.tcp.data_offset,
+                            flags: self.tcp.flags,
+                            window_size: self.tcp.window_size,
+                            checksum: 0,
+                            urgent_pointer: self.tcp.urgent_pointer,
+                            options: [],
+                        },
+                        sum = inout(reg) sum,
+                        options(att_syntax)
+                    );
+                }
+            }
+        }
+
+        self.tcp.checksum = csum::fold_checksum(csum::finalize(sum));
+
+        // If the checksum calculation results in the value zero (all 16 bits 0)
+        // it should be sent as the ones' complement (all 1s) as a zero-value
+        // checksum indicates no checksum has been calculated.[7] In this case,
+        // any specific processing is not required at the receiver, because all
+        // 0s and all 1s are equal to zero in 1's complement arithmetic.
+        if self.tcp.checksum == 0 {
+            self.tcp.checksum = 0xffff;
+        }
+
+        self.tcp.checksum
     }
 }
 

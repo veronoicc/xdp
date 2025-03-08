@@ -59,6 +59,41 @@ fn checksums_ipv6_udp() {
     assert_eq!(packet.calc_udp_checksum().unwrap(), udp.udp.check);
 }
 
+/// Ensures we generate the correct IPv4 TCP checksum
+#[test]
+fn checksums_ipv4_tcp() {
+    let mut buf = [0u8; 2048];
+    let mut packet = Packet::testing_new(&mut buf);
+
+    PacketBuilder::ethernet2(SRC_MAC.0, DST_MAC.0)
+        .ipv4([192, 168, 1, 139], [192, 168, 1, 1], 64)
+        .tcp(9000, 10001, 0, 0, 0)
+        .write(&mut packet, IPV4_DATA)
+        .unwrap();
+
+    let tcp = TcpHeaders::parse_packet(&packet).unwrap().unwrap();
+    assert_eq!(packet.calc_tcp_checksum().unwrap(), tcp.tcp.checksum);
+}
+
+/// Ensures we generate the correct IPv6 TCP checksum
+#[test]
+fn checksums_ipv6_tcp() {
+    let mut buf = [0u8; 2048];
+    let mut packet = Packet::testing_new(&mut buf);
+
+    const SRC: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0x99f0, 0xdcf, 0x4be3, 0xd25a);
+    const DST: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
+
+    PacketBuilder::ethernet2(SRC_MAC.0, DST_MAC.0)
+        .ipv6(SRC.octets(), DST.octets(), 64)
+        .tcp(5353, 1111, 0, 0, 0)
+        .write(&mut packet, IPV6_DATA)
+        .unwrap();
+
+    let tcp = TcpHeaders::parse_packet(&packet).unwrap().unwrap();
+    assert_eq!(packet.calc_tcp_checksum().unwrap(), tcp.tcp.checksum);
+}
+
 /// Ensures we can calculate the payload checksum separately and still get
 /// the same final result
 #[test]
@@ -104,6 +139,54 @@ fn combines_partial_checksums() {
         let data_checksum = csum::partial(LARGER, 0);
         udp.calc_checksum(LARGER.len(), data_checksum);
         assert_eq!(udp.udp.check, expected);
+    }
+}
+
+/// Ensures we can calculate the payload checksum separately and still get
+/// the same final result for TCP
+#[test]
+fn combines_partial_checksums_tcp() {
+    let mut buf = [0u8; 2048];
+    let mut packet = Packet::testing_new(&mut buf);
+
+    {
+        const SRC: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+        const DST: Ipv4Addr = Ipv4Addr::new(100, 1, 100, 1);
+
+        PacketBuilder::ethernet2(SRC_MAC.0, DST_MAC.0)
+            .ipv4(SRC.octets(), DST.octets(), 64)
+            .tcp(5353, 1111, 0, 0, 0)
+            .write(&mut packet, LARGER)
+            .unwrap();
+
+        let mut tcp = TcpHeaders::parse_packet(&packet).unwrap().unwrap();
+        let expected = tcp.tcp.checksum;
+        assert_eq!(packet.calc_tcp_checksum().unwrap(), expected);
+
+        let data_checksum = csum::partial(LARGER, 0);
+        tcp.calc_checksum(LARGER.len(), data_checksum);
+        assert_eq!(tcp.tcp.checksum, expected);
+    }
+
+    packet.clear();
+
+    {
+        const SRC: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0x99f0, 0xdcf, 0x4be3, 0xd25a);
+        const DST: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb);
+
+        PacketBuilder::ethernet2(SRC_MAC.0, DST_MAC.0)
+            .ipv6(SRC.octets(), DST.octets(), 64)
+            .tcp(5353, 1111, 0, 0, 0)
+            .write(&mut packet, LARGER)
+            .unwrap();
+
+        let mut tcp = TcpHeaders::parse_packet(&packet).unwrap().unwrap();
+        let expected = tcp.tcp.checksum;
+        assert_eq!(packet.calc_tcp_checksum().unwrap(), expected);
+
+        let data_checksum = csum::partial(LARGER, 0);
+        tcp.calc_checksum(LARGER.len(), data_checksum);
+        assert_eq!(tcp.tcp.checksum, expected);
     }
 }
 
