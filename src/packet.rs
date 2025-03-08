@@ -1,821 +1,668 @@
-//! Utilities for raw [`Packet`] reading and writing
+#![allow(non_camel_case_types)]
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub mod csum;
-pub mod net_types;
+use crate::{libc::socket, packet::Pod};
+use std::{
+    io::{Error, ErrorKind, Result},
+    mem,
+    os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
+};
 
-use crate::libc;
-use std::fmt;
+/// Types for [`nlmsghdr::nlmsg_type`]
+///
+/// <include/uapi/linux/netlink.h>
+mod msg_kind {
+    pub type Enum = u16;
 
-/// Errors that can occur when reading/writing [`Packet`] contents
-#[derive(Debug)]
-pub enum PacketError {
-    /// The packet head could not be moved down as there was not enough headroom
-    InsufficientHeadroom {
-        /// The amount of bytes that the head attempted to move down
-        diff: usize,
-        /// The head position
-        head: usize,
-    },
-    /// Attempted to move the head past the tail, or the tail past the end of the
-    /// packet's maximum
-    InvalidPacketLength {},
-    /// Attempted to get or set data at an invalid offset
-    InvalidOffset {
-        /// The invalid offset
-        offset: usize,
-        /// The length the offset must be below
-        length: usize,
-    },
-    /// Attempt to retrieve data outside the bounds of the currently valid contents
-    InsufficientData {
-        /// The offset the data would start at
-        offset: usize,
-        /// The size of the data requested
-        size: usize,
-        /// The length of the actual valid contents
-        length: usize,
-    },
-    /// TX checksum offload is not supported
-    ChecksumUnsupported,
-    /// TX timestamp is not supported
-    TimestampUnsupported,
+    //pub const NOOP: Enum = 1;
+    pub const ERROR: Enum = 2;
+    pub const DONE: Enum = 3;
+    //pub const OVERRUN: Enum = 4;
+
+    pub const GENL_ID_CTRL: Enum = 0x10;
 }
 
-impl PacketError {
-    /// Gets a static string description of the error
-    #[inline]
-    pub fn discriminant(&self) -> &'static str {
-        match self {
-            Self::InsufficientHeadroom { .. } => "insufficient headroom",
-            Self::InvalidPacketLength {} => "invalid packet length",
-            Self::InvalidOffset { .. } => "invalid offset",
-            Self::InsufficientData { .. } => "insufficient data",
-            Self::ChecksumUnsupported => "TX checksum unsupported",
-            Self::TimestampUnsupported => "TX timestamp unsupported",
+/// Flags for [`nlmsghdr::nlmsg_flags`]
+///
+/// <include/uapi/linux/netlink.h>>
+mod msg_flags {
+    pub type Enum = u16;
+
+    /// It is a request message
+    pub const REQUEST: Enum = 0x01;
+    // Multipart message, terminated by [`msg_kind::DONE`]
+    pub const MULTI: Enum = 0x02;
+
+    /// Extended ACK TVLs were included
+    pub const ACK_TLVS: Enum = 0x200;
+
+    pub const NESTED: Enum = 1 << 15;
+    pub const NET_BYTEORDER: Enum = 1 << 14;
+
+    pub const TYPE_MASK: Enum = !(NESTED | NET_BYTEORDER);
+}
+
+/// Generic netlink constants
+///
+/// <include/uapi/linux/genetlink.h>
+mod generic {
+    pub const CTRL_CMD_GETFAMILY: u8 = 3;
+
+    pub const CTRL_ATTR_FAMILY_ID: u16 = 1;
+    pub const CTRL_ATTR_FAMILY_NAME: u16 = 2;
+}
+
+/// netdev constants
+///
+/// <include/uapi/linux/netdev.h>
+mod netdev {
+    pub const NETDEV_CMD_DEV_GET: u8 = 1;
+
+    pub const NETDEV_A_DEV_IFINDEX: u16 = 1;
+    pub const NETDEV_A_DEV_XDP_FEATURES: u16 = 3;
+    pub const NETDEV_A_DEV_XDP_ZC_MAX_SEGS: u16 = 4;
+    pub const NETDEV_A_DEV_XDP_RX_METADATA_FEATURES: u16 = 5;
+    pub const NETDEV_A_DEV_XSK_FEATURES: u16 = 6;
+}
+
+const GENL_VERSION: u8 = 2;
+const NETLINK_EXT_ACK: i32 = 11;
+const NLMSGERR_ATTR_MSG: u16 = 1;
+
+macro_rules! len {
+    ($record:ty) => {
+        // SAFETY: internal only
+        unsafe impl Pod for $record {}
+
+        impl $record {
+            /// The length in bytes of this type
+            const LEN: usize = mem::size_of::<$record>();
         }
-    }
+    };
 }
 
-impl std::error::Error for PacketError {}
-
-impl fmt::Display for PacketError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
-    }
+#[repr(C)]
+struct sockaddr_nl {
+    nl_family: u16,
+    nl_pad: u16,
+    nl_pid: u32,
+    nl_groups: u32,
 }
 
-/// Marker trait used to indicate the type is a POD and can be safely converted
-/// to and from raw bytes
-///
-/// # Safety
-///
-/// See [`std::mem::zeroed`]
-pub unsafe trait Pod: Sized {
-    /// Gets the size of the type in bytes
+/// Fixed format metadata header of Netlink messages
+#[repr(C)]
+struct nlmsghdr {
+    /// Length of message including header
+    nlmsg_len: u32,
+    /// Message content type
+    nlmsg_type: msg_kind::Enum,
+    /// Additional flags
+    nlmsg_flags: msg_flags::Enum,
+    /// Sequence number
+    nlmsg_seq: u32,
+    /// Sending process port ID
+    nlmsg_pid: u32,
+}
+
+len!(nlmsghdr);
+
+/// netlink uses 4 byte alignment
+#[inline]
+const fn align(len: usize) -> usize {
+    (len + 3) & !3
+}
+
+/// Generic netlink metadata header
+#[repr(C)]
+struct genlmsghdr {
+    cmd: u8,
+    version: u8,
+    __reserved: u16,
+}
+
+len!(genlmsghdr);
+
+#[repr(C)]
+struct nlattr {
+    nla_len: u16,
+    nla_type: u16,
+}
+
+len!(nlattr);
+
+#[repr(C)]
+struct nlmsgerr {
+    /// The error code, 0 for no error
+    error: i32,
+    /// The original request
+    msg: nlmsghdr,
+}
+
+len!(nlmsgerr);
+
+struct Buf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> Buf<N> {
     #[inline]
-    fn size() -> usize {
-        std::mem::size_of::<Self>()
-    }
-
-    /// Gets a zeroed [`Self`]
-    #[inline]
-    fn zeroed() -> Self {
-        // SAFETY: by implementing Pod the user is saying that an all zero block
-        // is a valid representation of this type
-        unsafe { std::mem::zeroed() }
-    }
-
-    /// Gets [`Self`] as a byte slice
-    #[inline]
-    fn as_bytes(&self) -> &[u8] {
-        // SAFETY: by implementing Pod the user is saying that the struct can be
-        // represented safely by a byte slice
-        unsafe {
-            std::slice::from_raw_parts((self as *const Self).cast(), std::mem::size_of::<Self>())
-        }
-    }
-}
-
-/// Configures TX checksum offload when setting TX metadata via [`Packet::set_tx_metadata`]
-pub enum CsumOffload {
-    /// Requests checksum offload
-    Request {
-        /// The offset from the start of the packet where the checksum calculation should start
-        start: u16,
-        /// The offset from `start` where the checksum should be stored
-        offset: u16,
-    },
-    /// Offload is not requested
-    None,
-}
-
-/// A packet of data which can be received by the kernel or sent by userspace
-///
-/// ```text
-/// ┌──────────────────┌─────────────────┌───────────────────────┌─────────────┐
-/// │headroom (kernel) │headroom (opt)   │packet                 │remainder    │
-/// └──────────────────└─────────────────└───────────────────────└─────────────┘
-///                                      ▲                       ▲              
-///                                      │                       │              
-///                                      │                       │              
-///                                      head                    tail           
-/// ```
-///
-/// 1. The first ([`libc::xdp::XDP_PACKET_HEADROOM`]) segment of the buffer is
-///     reserved for kernel usage
-/// 1. `headroom` is an optional segment that can be configured on the [`crate::umem::UmemCfgBuilder::head_room`]
-///     the packet is allocated from which the kernel will not fill with data,
-///     allowing the packet to grow downwards (eg. IPv4 -> IPv6) without copying
-///     bytes
-/// 1. The next segment is the actual packet contents as received by the NIC or
-///     sent by userspace
-/// 1. The last segment is the uninitialized portion of the chunk occupied by this
-///     packet, up to the size configured on the owning [`crate::Umem`].
-///
-/// The packet portion of the packet is then composed of the various layers/data,
-/// for example an IPv4 UDP packet:
-///
-/// ```text
-/// ┌───────────────┌────────────────────┌────────┌──────────┐    
-/// │ethernet       │ipv4                │udp     │data...   │    
-/// └───────────────└────────────────────└────────└──────────┘    
-/// ▲               ▲                    ▲        ▲          ▲    
-/// │               │                    │        │          │    
-/// │               │                    │        │          │    
-///  head            +14                  +34      +42        tail
-/// ```
-pub struct Packet {
-    /// The entire packet buffer, including headroom, initialized packet contents,
-    /// and uninitialized/empty remainder
-    pub(crate) data: *mut u8,
-    pub(crate) capacity: usize,
-    /// The offset in data where the packet starts
-    pub(crate) head: usize,
-    /// The offset in data where the packet ends
-    pub(crate) tail: usize,
-    pub(crate) base: *const u8,
-    pub(crate) options: u32,
-}
-
-impl Packet {
-    /// Only used for testing
-    #[doc(hidden)]
-    pub fn testing_new(buf: &mut [u8; 2 * 1024]) -> Self {
-        let data = &mut buf[libc::xdp::XDP_PACKET_HEADROOM as usize..];
+    fn new() -> Self {
         Self {
-            data: data.as_mut_ptr(),
-            capacity: data.len(),
-            head: 0,
-            tail: 0,
-            base: std::ptr::null(),
-            options: 0,
+            buf: [0u8; N],
+            len: 0,
         }
     }
 
-    /// The number of initialized/valid bytes in the packet
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # let mut buf = [0u8; 2 * 1024];
-    /// # let mut packet = xdp::Packet::testing_new(&mut buf);
-    ///
-    /// assert_eq!(0, packet.len());
-    /// packet.insert(0, &[2; 21]).expect("failed to insert slice");
-    /// assert_eq!(21, packet.len());
-    /// ```
     #[inline]
-    pub fn len(&self) -> usize {
-        self.tail - self.head
-    }
-
-    /// True if the packet is empty
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # let mut buf = [0u8; 2 * 1024];
-    /// # let mut packet = xdp::Packet::testing_new(&mut buf);
-    ///
-    /// assert!(packet.is_empty());
-    /// packet.insert(0, &[1]).expect("failed to insert slice");
-    /// assert!(!packet.is_empty());
-    /// ```
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.head == self.tail
-    }
-
-    /// The total capacity of the packet.
-    ///
-    /// Note that this never includes the [`libc::xdp::XDP_PACKET_HEADROOM`]
-    /// part of every packet
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// let mut umem = xdp::Umem::map(
-    ///     xdp::umem::UmemCfgBuilder::default().build().unwrap()
-    /// ).expect("failed to map Umem");
-    ///
-    /// unsafe {
-    ///     let packet = umem.alloc().expect("failed to allocate packet");
-    ///     // The default size is 4k (page size)
-    ///     assert_eq!(packet.capacity(), 4 * 1024 - xdp::libc::xdp::XDP_PACKET_HEADROOM as usize);
-    /// }
-    /// ```
-    #[inline]
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// Resets the tail of this packet, causing it to become empty
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # let mut buf = [0u8; 2 * 1024];
-    /// # let mut packet = xdp::Packet::testing_new(&mut buf);
-    ///
-    /// assert!(packet.is_empty());
-    /// packet.insert(0, &[2; 21]).expect("failed to insert slice");
-    /// packet.clear();
-    /// assert!(packet.is_empty());
-    /// ```
-    #[inline]
-    pub fn clear(&mut self) {
-        self.tail = self.head;
-    }
-
-    /// If true, this packet is fragmented, and the next packet in the queue
-    /// continues this packet, until this returns `false`
-    #[inline]
-    pub fn is_continued(&self) -> bool {
-        (self.options & libc::xdp::XdpPktOptions::XDP_PKT_CONTD) != 0
-    }
-
-    // TODO: Create a different type to indicate checksum since it's not going
-    // to change so the user can choose at init time whether they want checksum
-    // offload or not
-    /// Checks if the NIC this packet is being sent on supports tx checksum offload
-    #[inline]
-    pub fn can_offload_checksum(&self) -> bool {
-        (self.options & libc::InternalXdpFlags::SUPPORTS_CHECKSUM_OFFLOAD) != 0
-    }
-
-    /// Adjust the head of the packet up or down by `diff` bytes
-    ///
-    /// This method is the equivalent of [`bpf_xdp_adjust_head`](https://docs.ebpf.io/linux/helper-function/bpf_xdp_adjust_head/),
-    /// allowing modification of layers (eg. layer 3 IPv4 <-> IPv6) without needing
-    /// to copy the entirety of the packet data up or down.
-    ///
-    /// Adjusting the head down requires that headroom was configured for the [`crate::Umem`]
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// let mut umem = xdp::Umem::map(
-    ///     xdp::umem::UmemCfgBuilder {
-    ///         head_room: 20,
-    ///         ..Default::default()
-    ///     }.build().unwrap()
-    /// ).expect("failed to map Umem");
-    ///
-    /// unsafe {
-    ///     let mut packet = umem.alloc().expect("failed to allocate packet");
-    ///
-    ///     // We can't extend the head past the tail, so first insert some data
-    ///     packet.insert(0, &[0xff; 33]).unwrap();
-    ///     assert_eq!(33, packet.len());
-    ///
-    ///     // Adjust the head up to match the tail, making the packet empty
-    ///     packet.adjust_head(33).unwrap();
-    ///     assert!(packet.is_empty());
-    ///
-    ///     // When using alloc, the head is already adjust to the headroom, the
-    ///     // same as the kernel would do when receiving a packet, so we can
-    ///     // adjust the head down further
-    ///     packet.adjust_head(-53).unwrap();
-    ///     assert_eq!(53, packet.len());
-    ///
-    ///     // ...but no further
-    ///     assert!(packet.adjust_head(-1).is_err());
-    /// }
-    /// ```
-    #[inline]
-    pub fn adjust_head(&mut self, diff: i32) -> Result<(), PacketError> {
-        if diff < 0 {
-            let diff = diff.unsigned_abs() as usize;
-            if diff > self.head {
-                return Err(PacketError::InsufficientHeadroom {
-                    diff,
-                    head: self.head,
-                });
-            }
-
-            self.head -= diff;
-        } else {
-            let diff = diff as usize;
-            if self.head + diff > self.tail {
-                return Err(PacketError::InvalidPacketLength {});
-            }
-
-            self.head += diff;
+    fn read<P: Pod>(&self, off: &mut usize) -> Result<P> {
+        if *off > N || *off + P::size() > self.len {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "received incomplete netlink packet",
+            ));
         }
 
-        Ok(())
+        let p =
+            // SAFETY: we've validated the pointer read is within bounds
+            unsafe { std::ptr::read_unaligned(self.buf.as_ptr().byte_offset(*off as _).cast()) };
+        *off += P::size();
+        Ok(p)
     }
 
-    /// Adjust the tail of the packet up or down by `diff` bytes
-    ///
-    /// This method is the equivalent of [`bpf_xdp_adjust_tail`](https://docs.ebpf.io/linux/helper-function/bpf_xdp_adjust_tail/),
-    /// and allows extending or truncating the data portion of a packet
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// let mut umem = xdp::Umem::map(
-    ///     xdp::umem::UmemCfgBuilder {
-    ///         head_room: 20,
-    ///         ..Default::default()
-    ///     }.build().unwrap()
-    /// ).expect("failed to map Umem");
-    ///
-    /// unsafe {
-    ///     let mut packet = umem.alloc().expect("failed to allocate packet");
-    ///     packet.insert(0, &[0xff; 10]).unwrap();
-    ///     assert_eq!(10, packet.len());
-    ///
-    ///     for _ in 0..10 {
-    ///         packet.adjust_tail(-1).expect("failed to reduce tail");
-    ///     }
-    ///
-    ///     assert!(packet.is_empty());
-    ///     
-    ///     packet.adjust_tail(10).expect("failed to extend the tail");
-    ///     assert_eq!(&packet[..10], &[0xff; 10]);
-    /// }
-    /// ```
     #[inline]
-    pub fn adjust_tail(&mut self, diff: i32) -> Result<(), PacketError> {
-        if diff < 0 {
-            let diff = diff.unsigned_abs() as usize;
-            if diff > self.tail || self.tail - diff < self.head {
-                return Err(PacketError::InsufficientHeadroom {
-                    diff,
-                    head: self.head,
-                });
-            }
-
-            self.tail -= diff;
-        } else {
-            let diff = diff as usize;
-            if self.tail + diff > self.capacity {
-                return Err(PacketError::InvalidPacketLength {});
-            }
-
-            self.tail += diff;
-        }
-
-        Ok(())
-    }
-
-    /// Reads a `T` at the specified offset
-    ///
-    /// # Errors
-    ///
-    /// - The offset is not within bounds
-    /// - The offset + size of `T` is not within bounds
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use xdp::packet::net_types;
-    /// use std::net::Ipv4Addr;
-    /// # use xdp::packet::Pod;
-    /// # let mut umem = xdp::Umem::map(
-    /// #    xdp::umem::UmemCfgBuilder {
-    /// #        head_room: 20,
-    /// #        ..Default::default()
-    /// #    }.build().unwrap()
-    /// # ).expect("failed to map Umem");
-    /// # let mut packet = unsafe {
-    /// #    let mut packet = umem.alloc().expect("failed to allocate packet");
-    /// #    packet.adjust_tail(34).unwrap();
-    /// #    packet.write(0, net_types::EthHdr {
-    /// #        source: net_types::MacAddress([1; 6]),
-    /// #        destination: net_types::MacAddress([2; 6]),
-    /// #        ether_type: net_types::EtherType::Ipv4 }
-    /// #    ).unwrap();
-    /// #    let mut ip = net_types::Ipv4Hdr::zeroed();
-    /// #    ip.reset(64, net_types::IpProto::Udp);
-    /// #    ip.source = u32::from_be_bytes([100, 1, 2, 100]).into();
-    /// #    ip.destination = u32::from_be_bytes([200, 2, 1, 200]).into();
-    /// #    packet.write(net_types::EthHdr::LEN, ip).unwrap();
-    /// #    assert_eq!(packet.len(), net_types::EthHdr::LEN + net_types::Ipv4Hdr::LEN);
-    /// #    packet
-    /// # };
-    /// // Read an Ipv4 header, which directly follows an Ethernet II header
-    /// let ip_hdr = packet.read::<net_types::Ipv4Hdr>(net_types::EthHdr::LEN).unwrap();
-    /// assert_eq!(ip_hdr.source.host(), Ipv4Addr::new(100, 1, 2, 100).to_bits());
-    /// assert_eq!(ip_hdr.destination.host(), Ipv4Addr::new(200, 2, 1, 200).to_bits());
-    /// ```
-    #[inline]
-    pub fn read<T: Pod>(&self, offset: usize) -> Result<T, PacketError> {
+    fn write<P: Pod>(&mut self, off: &mut usize, item: P) -> Result<()> {
         assert!(
-            offset < 4096,
-            "'offset' is wildly out of range and indicates a bug"
+            *off < N && *off + P::size() <= self.len,
+            "this indicates a bug in the netlink code, please file an issue"
         );
-
-        let start = self.head + offset;
-        if start > self.tail {
-            return Err(PacketError::InvalidOffset {
-                offset,
-                length: self.tail - self.head,
-            });
-        }
-
-        let size = std::mem::size_of::<T>();
-        if start + size > self.tail {
-            return Err(PacketError::InsufficientData {
-                offset,
-                size,
-                length: self.tail - offset,
-            });
-        }
-
-        // SAFETY: we've validated the pointer read is within bounds
-        Ok(unsafe { std::ptr::read_unaligned(self.data.byte_offset(start as _).cast()) })
-    }
-
-    /// Writes the contents of `item` at the specified `offset`
-    ///
-    /// This does an in-place write, memory above or below `[offset..offset + sizeof(T)]`
-    /// is not affected
-    ///
-    /// # Errors
-    ///
-    /// - The offset is not within bounds
-    /// - The offset + size of `T` is not within bounds
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use xdp::packet::net_types;
-    /// use std::net::Ipv4Addr;
-    /// # use xdp::packet::Pod;
-    /// # let mut umem = xdp::Umem::map(
-    /// #    xdp::umem::UmemCfgBuilder {
-    /// #        head_room: 0,
-    /// #        ..Default::default()
-    /// #    }.build().unwrap()
-    /// # ).expect("failed to map Umem");
-    /// # let mut packet = unsafe {
-    /// #    umem.alloc().expect("failed to allocate packet")
-    /// # };
-    /// // Extend the tail so we have enough space for the writes
-    /// packet.adjust_tail(42).unwrap();
-    ///
-    /// packet.write(0, net_types::EthHdr {
-    ///     source: net_types::MacAddress([1; 6]),
-    ///     destination: net_types::MacAddress([2; 6]),
-    ///     ether_type: net_types::EtherType::Ipv4 }
-    /// ).expect("failed to write ethhdr");
-    ///
-    /// let mut ip = net_types::Ipv4Hdr::zeroed();
-    /// ip.reset(64, net_types::IpProto::Udp);
-    /// ip.source = u32::from_be_bytes([100, 1, 2, 100]).into();
-    /// ip.destination = u32::from_be_bytes([200, 2, 1, 200]).into();
-    /// ip.total_length = ((net_types::Ipv4Hdr::LEN + net_types::UdpHdr::LEN + 5) as u16).into();
-    /// packet.write(net_types::EthHdr::LEN, ip).expect("failed to write ip hdr");
-    ///
-    /// packet.write(net_types::EthHdr::LEN + net_types::Ipv4Hdr::LEN, net_types::UdpHdr {
-    ///     source: 50000.into(),
-    ///     destination: 80.into(),
-    ///     length: ((net_types::UdpHdr::LEN + 5) as u16).into(),
-    ///     check: 0,
-    /// }).expect("failed to write ip hdr");
-    ///
-    /// packet.insert(
-    ///     net_types::EthHdr::LEN + net_types::Ipv4Hdr::LEN + net_types::UdpHdr::LEN,
-    ///     &[0xf0; 5]
-    /// ).unwrap();
-    /// ```
-    #[inline]
-    pub fn write<T: Pod>(&mut self, offset: usize, item: T) -> Result<(), PacketError> {
-        assert!(
-            offset < 4096,
-            "'offset' is wildly out of range and indicates a bug"
-        );
-
-        let start = self.head + offset;
-        if start > self.tail {
-            return Err(PacketError::InvalidOffset {
-                offset,
-                length: self.tail - self.head,
-            });
-        }
-
-        let size = std::mem::size_of::<T>();
-        if start + size > self.tail {
-            return Err(PacketError::InsufficientData {
-                offset,
-                size,
-                length: self.tail - offset,
-            });
-        }
 
         // SAFETY: we've validated the pointer write is within bounds
         unsafe {
-            std::ptr::write_unaligned(
-                self.data.byte_offset((self.head + offset) as _).cast(),
-                item,
-            );
-        }
+            std::ptr::write_unaligned(self.buf.as_mut_ptr().byte_offset(*off as _).cast(), item);
+        };
+        *off += P::size();
         Ok(())
     }
 
-    /// Retrieves a fixed size array of bytes beginning at the specified offset
-    ///
-    /// # Errors
-    ///
-    /// - The offset is not within bounds
-    /// - The offset + `N` is not within bounds
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use xdp::packet::Pod;
-    /// # let mut umem = xdp::Umem::map(
-    /// #    xdp::umem::UmemCfgBuilder {
-    /// #        head_room: 0,
-    /// #        ..Default::default()
-    /// #    }.build().unwrap()
-    /// # ).expect("failed to map Umem");
-    /// # let mut packet = unsafe {
-    /// #    umem.alloc().expect("failed to allocate packet")
-    /// # };
-    /// // Insert a u32
-    /// packet.insert(0, &0xaabbccddu32.to_ne_bytes()).unwrap();
-    ///
-    /// let mut bytes = [0u8; 4];
-    /// packet.array_at_offset(0, &mut bytes).unwrap();
-    ///
-    /// assert_eq!(u32::from_ne_bytes(bytes), 0xaabbccddu32);
-    /// ```
     #[inline]
-    pub fn array_at_offset<const N: usize>(
-        &self,
-        offset: usize,
-        array: &mut [u8; N],
-    ) -> Result<(), PacketError> {
-        struct AssertReasonable<const N: usize>;
-
-        impl<const N: usize> AssertReasonable<N> {
-            const OK: () = assert!(N < 4096, "the array size far too large");
+    fn push<P: Pod>(&mut self, data: P) -> Result<()> {
+        if self.len + P::size() > N {
+            return Err(Error::new(
+                ErrorKind::OutOfMemory,
+                "unable to append data to buffer, it would overflow",
+            ));
         }
 
-        const fn assert_reasonable<const N: usize>() {
-            let () = AssertReasonable::<N>::OK;
-        }
-
-        assert_reasonable::<N>();
-
-        assert!(
-            offset < 4096,
-            "'offset' is wildly out of range and indicates a bug"
-        );
-
-        let start = self.head + offset;
-        if start + N > self.tail {
-            return Err(PacketError::InsufficientData {
-                offset,
-                size: N,
-                length: self.tail - offset,
-            });
-        }
-
-        // SAFETY: we've validated the range of data we are reading is valid
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.data.byte_offset(offset as _),
-                array.as_mut_ptr(),
-                N,
-            );
-        }
+        self.buf[self.len..self.len + P::size()].copy_from_slice(data.as_bytes());
+        self.len += P::size();
         Ok(())
     }
 
-    /// Inserts a slice at the specified offset, shifting any bytes above `offset`
-    /// upwards by `slice.len()`
-    ///
-    /// # Errors
-    ///
-    /// - The offset is not within bounds
-    /// - The offset + `slice.len()` would exceed the capacity
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use xdp::packet::Pod;
-    /// # let mut umem = xdp::Umem::map(
-    /// #    xdp::umem::UmemCfgBuilder {
-    /// #        head_room: 0,
-    /// #        ..Default::default()
-    /// #    }.build().unwrap()
-    /// # ).expect("failed to map Umem");
-    /// # let mut packet = unsafe {
-    /// #    umem.alloc().expect("failed to allocate packet")
-    /// # };
-    /// // Insert a u32
-    /// packet.insert(0, &0xf0f1f2f3u32.to_ne_bytes()).unwrap();
-    ///
-    /// // Insert a u64
-    /// packet.insert(0, &u64::MAX.to_ne_bytes()).unwrap();
-    ///
-    /// let mut bytes = [0u8; 8];
-    /// packet.array_at_offset(0, &mut bytes).unwrap();
-    ///
-    /// assert_eq!(u64::from_ne_bytes(bytes), u64::MAX);
-    ///
-    /// let mut bytes = [0u8; 4];
-    /// packet.array_at_offset(8, &mut bytes).unwrap();
-    ///
-    /// assert_eq!(u32::from_ne_bytes(bytes), 0xf0f1f2f3);
-    /// ```
     #[inline]
-    pub fn insert(&mut self, offset: usize, slice: &[u8]) -> Result<(), PacketError> {
-        assert!(
-            offset < 4096,
-            "'offset' is wildly out of range and indicates a bug"
-        );
-        assert!(slice.len() <= 4096, "the slice length is far too large");
-
-        if self.tail + slice.len() > self.capacity {
-            return Err(PacketError::InvalidPacketLength {});
-        } else if offset > self.tail {
-            return Err(PacketError::InvalidOffset {
-                offset,
-                length: self.len(),
-            });
+    fn push_attribute(&mut self, kind: u16, data: &[u8]) -> Result<()> {
+        let tail = align(self.len);
+        if tail + align(nlattr::LEN + data.len()) > N {
+            return Err(Error::new(
+                ErrorKind::OutOfMemory,
+                "unable to append attribute to buffer, it would overflow",
+            ));
         }
 
-        let adjusted_offset = self.head + offset;
-        let shift = self.tail + self.head - adjusted_offset;
+        let attr_len = {
+            let attr_len = nlattr::LEN + data.len();
 
-        // SAFETY: we validate we're within bounds before doing any writes to the
-        // pointer, which is alive as long as the owning mmap
-        unsafe {
-            if shift > 0 {
-                std::ptr::copy(
-                    self.data.byte_offset(adjusted_offset as isize),
-                    self.data
-                        .byte_offset((adjusted_offset + slice.len()) as isize),
-                    shift,
-                );
-            }
+            self.len = tail;
+            self.push(nlattr {
+                nla_type: kind,
+                nla_len: attr_len as u16,
+            })?;
+            self.buf[self.len..self.len + data.len()].copy_from_slice(data);
 
-            std::ptr::copy_nonoverlapping(
-                slice.as_ptr(),
-                self.data.byte_offset(adjusted_offset as _),
-                slice.len(),
-            );
-        }
+            attr_len
+        };
 
-        self.tail += slice.len();
+        self.len = tail + align(attr_len);
         Ok(())
     }
+}
 
-    /// Sets the specified [TX metadata](https://github.com/torvalds/linux/blob/ae90f6a6170d7a7a1aa4fddf664fbd093e3023bc/Documentation/networking/xsk-tx-metadata.rst)
-    ///
-    /// Calling this function requires that the [`crate::umem::UmemCfgBuilder::tx_checksum`]
-    /// and/or [`crate::umem::UmemCfgBuilder::tx_timestamp`] were true
-    ///
-    /// - If `csum` is `CsumOffload::Request`, this will request that the Layer 4
-    ///     checksum computation be offload to the NIC before transmission. Note that
-    ///     this requires that the IP pseudo header checksum be calculated and stored
-    ///     in the same location.
-    /// - If `request_timestamp` is true, requests that the NIC write the timestamp
-    ///     the packet was transmitted. This can be retrieved using [`crate::CompletionRing::dequeue_with_timestamps`]
-    #[inline]
-    pub fn set_tx_metadata(
+struct AttrIter<'b, const N: usize> {
+    buf: &'b Buf<N>,
+    off: &'b mut usize,
+    len: usize,
+}
+
+impl<'b, const N: usize> AttrIter<'b, N> {
+    fn generic(buf: &'b Buf<N>, msg_hdr: &nlmsghdr, off: &'b mut usize) -> Result<Self> {
+        let _gen_hdr = buf.read::<genlmsghdr>(off)?;
+        *off = align(*off);
+        let len = msg_hdr.nlmsg_len as usize - align(genlmsghdr::LEN) - nlmsghdr::LEN;
+
+        Ok(Self { buf, off, len })
+    }
+
+    fn error(buf: &'b Buf<N>, msg_hdr: &nlmsghdr, _err_msg: &nlmsgerr, off: &'b mut usize) -> Self {
+        let len = msg_hdr.nlmsg_len as usize - align(nlmsgerr::LEN) - nlmsghdr::LEN;
+        Self { buf, off, len }
+    }
+}
+
+impl<'b, const N: usize> Iterator for AttrIter<'b, N> {
+    type Item = (u16, &'b [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.len < nlattr::LEN {
+            return None;
+        }
+
+        let mut off = *self.off;
+        let attr = self.buf.read::<nlattr>(&mut off).ok()?;
+        let kind = attr.nla_type & msg_flags::TYPE_MASK;
+        let tot_len = align(attr.nla_len as usize);
+        let data_len = attr.nla_len as usize - nlattr::LEN;
+
+        if tot_len > self.len {
+            return None;
+        }
+
+        let data = &self.buf.buf[off..off + data_len];
+
+        self.len -= tot_len;
+        *self.off += tot_len;
+
+        Some((kind, data))
+    }
+}
+
+impl<const N: usize> Drop for AttrIter<'_, N> {
+    fn drop(&mut self) {
+        *self.off += self.len;
+    }
+}
+
+macro_rules! io_err {
+    ($val:expr) => {{
+        if $val < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        $val as _
+    }};
+}
+
+struct NetlinkSocket {
+    sock: OwnedFd,
+    seq: u32,
+}
+
+impl NetlinkSocket {
+    fn send_and_recv<const N: usize, T>(
         &mut self,
-        csum: CsumOffload,
-        request_timestamp: bool,
-    ) -> Result<(), PacketError> {
-        use libc::xdp;
+        msg: &mut Buf<N>,
+        func: impl Fn(AttrIter<'_, N>) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        let seq = self.seq;
+        self.seq += 1;
 
-        // This would mean the user is making a request that won't actually do anything
-        debug_assert!(request_timestamp || matches!(csum, CsumOffload::Request { .. }));
-
-        if matches!(csum, CsumOffload::Request { .. })
-            && (self.options & libc::InternalXdpFlags::SUPPORTS_CHECKSUM_OFFLOAD) == 0
-        {
-            return Err(PacketError::ChecksumUnsupported);
-        } else if request_timestamp
-            && (self.options & libc::InternalXdpFlags::SUPPORTS_TIMESTAMP) == 0
-        {
-            return Err(PacketError::TimestampUnsupported);
-        }
-
-        // SAFETY: While this looks pretty dangerous because we are getting a pointer
-        // before the base packet, it's actually safe as the presence of either the
-        // checksum offload or timestamp flags means the umem was registered with
-        // space for an xsk_tx_metadata that the kernel will also know the location
-        // of
+        // SAFETY: various syscalls and buffer manipulation
         unsafe {
-            let mut tx_meta = std::mem::zeroed::<xdp::xsk_tx_metadata>();
+            let mut off = 0;
+            let len = msg.len;
 
-            if let CsumOffload::Request { start, offset } = csum {
-                tx_meta.flags |= xdp::XdpTxFlags::XDP_TXMD_FLAGS_CHECKSUM;
-                tx_meta.offload.request = xdp::xsk_tx_request {
-                    csum_start: start,
-                    csum_offset: offset,
-                };
+            let mut hdr = msg.read::<nlmsghdr>(&mut off)?;
+            off = 0;
+            hdr.nlmsg_seq = seq;
+            hdr.nlmsg_len = len as _;
+            msg.write(&mut off, hdr)?;
+
+            let sent: usize = io_err!(socket::send(
+                self.sock.as_raw_fd(),
+                msg.buf.as_ptr().cast(),
+                msg.len,
+                socket::MsgFlags::NONE
+            ));
+
+            if sent != msg.len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::FileTooLarge,
+                    "failed to send full nlmsg",
+                ));
             }
 
-            if request_timestamp {
-                tx_meta.flags |= xdp::XdpTxFlags::XDP_TXMD_FLAGS_TIMESTAMP;
+            let mut is_multi_part = true;
+
+            while is_multi_part {
+                msg.len = io_err!(socket::recv(
+                    self.sock.as_raw_fd(),
+                    msg.buf.as_mut_ptr().cast(),
+                    N,
+                    socket::MsgFlags::NONE
+                ));
+                is_multi_part = false;
+
+                let mut offset = 0;
+                while offset < msg.len {
+                    let msg_hdr = msg.read::<nlmsghdr>(&mut offset)?;
+                    if msg_hdr.nlmsg_flags & msg_flags::MULTI != 0 {
+                        is_multi_part = true;
+                    }
+
+                    if msg_hdr.nlmsg_seq != seq {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "invalid sequence in netlink response",
+                        ));
+                    }
+
+                    match msg_hdr.nlmsg_type {
+                        msg_kind::ERROR => {
+                            let err_hdr = msg.read::<nlmsgerr>(&mut offset)?;
+                            if err_hdr.error != 0 {
+                                // Query if the message has extended error information
+                                let message = if msg_hdr.nlmsg_flags & msg_flags::ACK_TLVS != 0 {
+                                    // We could also recover the offset of the failing attribute, but considering
+                                    // we only do 2 requests and both have a single attribute..
+                                    AttrIter::error(msg, &msg_hdr, &err_hdr, &mut offset).find_map(|(kind, data)| {
+                                        (kind == NLMSGERR_ATTR_MSG).then_some(String::from_utf8_lossy(&data[..data.len() - 2]).into_owned())
+                                    }).unwrap_or_else(|| format!("received netlink error code {}, and we failed to retrieve the additional information provided by the kernel", err_hdr.error))
+                                } else {
+                                    format!(
+                                        "received netlink error code {}, and no additional error information was provided by the kernel",
+                                        err_hdr.error
+                                    )
+                                };
+
+                                return Err(Error::new(ErrorKind::ConnectionRefused, message));
+                            } else {
+                                offset = align(msg_hdr.nlmsg_len as usize);
+                            }
+                        }
+                        msg_kind::DONE => {
+                            return Ok(None);
+                        }
+                        _other => {
+                            let res = func(AttrIter::generic(msg, &msg_hdr, &mut offset)?)?;
+                            if res.is_some() {
+                                return Ok(res);
+                            }
+                        }
+                    }
+                }
             }
 
-            std::ptr::write_unaligned(
-                self.data
-                    .byte_offset(
-                        self.head as isize - std::mem::size_of::<xdp::xsk_tx_metadata>() as isize,
-                    )
-                    .cast(),
-                tx_meta,
+            Ok(None)
+        }
+    }
+}
+
+macro_rules! read_attr {
+    ($kind:ty, $attr:expr) => {{
+        if $attr.len() != std::mem::size_of::<$kind>() {
+            None
+        } else {
+            let mut bytes = [0u8; std::mem::size_of::<$kind>()];
+            bytes.copy_from_slice($attr);
+            Some(<$kind>::from_ne_bytes(bytes))
+        }
+    }};
+}
+
+impl super::NicIndex {
+    pub(super) fn netdev_caps(&self) -> std::io::Result<super::NetdevCapabilities> {
+        // SAFETY: We validate the socket descriptor
+        let mut socket = unsafe {
+            let fd = socket::socket(
+                socket::AddressFamily::AF_NETLINK,
+                socket::Kind::SOCK_RAW,
+                socket::Protocol::NETLINK_GENERIC,
             );
-        }
 
-        self.options |= xdp::XdpPktOptions::XDP_TX_METADATA;
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
 
-        Ok(())
-    }
+            NetlinkSocket {
+                sock: OwnedFd::from_raw_fd(fd),
+                seq: 0xfeedfeed,
+            }
+        };
 
-    #[doc(hidden)]
-    #[inline]
-    pub fn inner_copy(&mut self) -> Self {
-        Self {
-            data: self.data,
-            capacity: self.capacity,
-            head: self.head,
-            tail: self.tail,
-            base: self.base,
-            options: self.options,
-        }
-    }
-}
-
-impl std::ops::Deref for Packet {
-    type Target = [u8];
-    fn deref(&self) -> &Self::Target {
-        // SAFETY: the pointer is valid as long as the mmap is alive
-        unsafe { &std::slice::from_raw_parts(self.data, self.capacity)[self.head..self.tail] }
-    }
-}
-
-impl std::ops::DerefMut for Packet {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: the pointer is valid as long as the mmap is alive
+        // SAFETY: POD + we give a valid sockaddr to bind
         unsafe {
-            &mut std::slice::from_raw_parts_mut(self.data, self.capacity)[self.head..self.tail]
+            // Enable extended ack, which can give use more detail error information
+            let enable = 1;
+            socket::setsockopt(
+                socket.sock.as_raw_fd(),
+                socket::Level::SOL_NETLINK,
+                NETLINK_EXT_ACK,
+                (&enable as *const i32).cast(),
+                mem::size_of_val(&enable) as _,
+            );
+
+            let mut nladdr = mem::zeroed::<sockaddr_nl>();
+            nladdr.nl_family = socket::AddressFamily::AF_NETLINK as _;
+
+            if socket::bind(
+                socket.sock.as_raw_fd(),
+                (&nladdr as *const sockaddr_nl).cast(),
+                mem::size_of::<sockaddr_nl>() as u32,
+            ) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+
+        // Just use the same buffer for sends and receives
+        let mut buf = Buf::<{ 2 * 1024 }>::new();
+
+        // Resolve the netdev family, this is mapping a friendly string to an integer id
+        let netdev_id = {
+            buf.push(nlmsghdr {
+                nlmsg_len: 0,
+                nlmsg_type: msg_kind::GENL_ID_CTRL,
+                nlmsg_flags: msg_flags::REQUEST,
+                nlmsg_seq: 0,
+                nlmsg_pid: 0,
+            })?;
+            buf.push(genlmsghdr {
+                cmd: generic::CTRL_CMD_GETFAMILY,
+                version: GENL_VERSION,
+                __reserved: 0,
+            })?;
+
+            // This is the attribute which informs netlink which family id we are querying
+            buf.push_attribute(generic::CTRL_ATTR_FAMILY_NAME, b"netdev\0")?;
+
+            socket
+                .send_and_recv(&mut buf, |attrs| -> Result<Option<u16>> {
+                    for (attr, data) in attrs {
+                        if attr != generic::CTRL_ATTR_FAMILY_ID {
+                            continue;
+                        }
+
+                        let Some(id) = read_attr!(u16, data) else {
+                            return Err(Error::new(
+                                ErrorKind::InvalidData,
+                                "unexpected size for `netdev` CTRL_ATTR_FAMILY_ID",
+                            ));
+                        };
+
+                        return Ok(Some(id));
+                    }
+
+                    Ok(None)
+                })?
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::NotFound,
+                        "failed to resolve the `netdev` family id",
+                    )
+                })?
+        };
+
+        // Now we can query the netdev to get the supported xdp features
+        buf.len = 0;
+        buf.push(nlmsghdr {
+            nlmsg_len: 0,
+            nlmsg_type: netdev_id,
+            nlmsg_flags: msg_flags::REQUEST,
+            nlmsg_seq: 0,
+            nlmsg_pid: 0,
+        })?;
+        buf.push(genlmsghdr {
+            cmd: netdev::NETDEV_CMD_DEV_GET,
+            version: GENL_VERSION,
+            __reserved: 0,
+        })?;
+
+        // This is the attribute used to tell netlink this is the interface index we wish to query
+        buf.push_attribute(netdev::NETDEV_A_DEV_IFINDEX, &self.0.to_ne_bytes())?;
+
+        let caps = socket.send_and_recv(&mut buf, |attrs| {
+            let mut xdp_features = None;
+            let mut zero_copy_max_segs = None;
+            let mut rx_metadata_features = None;
+            let mut xsk_features = None;
+
+            for (attr, data) in attrs {
+                match attr {
+                    netdev::NETDEV_A_DEV_IFINDEX => {
+                        let Some(ifindex) = read_attr!(u32, data) else {
+                            return Ok(None);
+                        };
+                        if ifindex != self.0 {
+                            return Ok(None);
+                        }
+                    }
+                    netdev::NETDEV_A_DEV_XDP_FEATURES => {
+                        let Some(xdp_feats) = read_attr!(u64, data) else {
+                            return Ok(None);
+                        };
+                        xdp_features = Some(xdp_feats);
+                    }
+                    netdev::NETDEV_A_DEV_XSK_FEATURES => {
+                        xsk_features = read_attr!(u64, data);
+                    }
+                    netdev::NETDEV_A_DEV_XDP_RX_METADATA_FEATURES => {
+                        rx_metadata_features = read_attr!(u64, data);
+                    }
+                    netdev::NETDEV_A_DEV_XDP_ZC_MAX_SEGS => {
+                        zero_copy_max_segs = read_attr!(u32, data);
+                    }
+                    _ => {}
+                }
+            }
+
+            let Some(xdp_features) = xdp_features else {
+                return Ok(None);
+            };
+
+            Ok(Some(super::NetdevCapabilities {
+                queue_count: 0,
+                zero_copy: match zero_copy_max_segs.unwrap_or(0) {
+                    0 => super::XdpZeroCopy::Unavailable,
+                    1 => super::XdpZeroCopy::Available,
+                    o => super::XdpZeroCopy::MultiBuffer(o),
+                },
+                xdp_features: super::XdpFeatures(xdp_features),
+                rx_metadata: super::XdpRxMetadata(rx_metadata_features.unwrap_or(0)),
+                tx_metadata: super::XdpTxMetadata(xsk_features.unwrap_or(0)),
+            }))
+        })?;
+
+        let Some(caps) = caps else {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "failed to query XDP features",
+            ));
+        };
+
+        Ok(caps)
+    }
+}
+
+pub fn partial(buf: &[u8], initial: u32) -> u32 {
+    let mut sum = initial;
+    let mut i = 0;
+
+    while i < buf.len() {
+        let word = if i + 1 < buf.len() {
+            u16::from_be_bytes([buf[i], buf[i + 1]]) as u32
+        } else {
+            (buf[i] as u32) << 8
+        };
+
+        sum = sum.wrapping_add(word);
+        i += 2;
+    }
+
+    sum
+}
+
+pub fn fold_checksum(sum: u32) -> u16 {
+    let mut sum = sum;
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+pub fn calc_tcp_checksum(
+    src_ip: &[u8],
+    dst_ip: &[u8],
+    tcp_header: &[u8],
+    payload: &[u8],
+) -> Result<u16> {
+    if src_ip.len() != dst_ip.len() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Source and destination IP addresses must have the same length",
+        ));
+    }
+
+    let mut sum = 0u32;
+
+    // Pseudo-header
+    sum = partial(src_ip, sum);
+    sum = partial(dst_ip, sum);
+    sum = partial(&[0, IpProto::Tcp as u8], sum);
+    sum = partial(&(tcp_header.len() as u16).to_be_bytes(), sum);
+
+    // TCP header and payload
+    sum = partial(tcp_header, sum);
+    sum = partial(payload, sum);
+
+    Ok(fold_checksum(sum))
+}
+
+#[derive(Debug)]
+pub enum TcpCalcError {
+    InvalidInput(String),
+    IoError(Error),
+}
+
+impl From<Error> for TcpCalcError {
+    fn from(err: Error) -> Self {
+        TcpCalcError::IoError(err)
+    }
+}
+
+impl std::fmt::Display for TcpCalcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TcpCalcError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
+            TcpCalcError::IoError(err) => write!(f, "IO error: {}", err),
         }
     }
 }
 
-impl From<Packet> for libc::xdp::xdp_desc {
-    fn from(packet: Packet) -> Self {
-        libc::xdp::xdp_desc {
-            // SAFETY: the pointer is valid as long as the mmap it is allocated
-            // from is alive
-            addr: unsafe {
-                packet
-                    .data
-                    .byte_offset(packet.head as _)
-                    .offset_from(packet.base) as _
-            },
-            len: (packet.tail - packet.head) as _,
-            options: packet.options & !libc::InternalXdpFlags::MASK,
-        }
-    }
-}
+impl std::error::Error for TcpCalcError {}
 
-impl std::io::Write for Packet {
-    #[inline]
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self.insert(self.tail - self.head, buf) {
-            Ok(()) => Ok(buf.len()),
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::StorageFull,
-                "not enough space available in packet",
-            )),
-        }
-    }
+impl super::Packet {
+    pub fn calc_tcp_checksum(&self, src_ip: &[u8], dst_ip: &[u8]) -> Result<u16, TcpCalcError> {
+        let tcp_header = self.read::<TcpHdr>(EthHdr::LEN + Ipv4Hdr::LEN)?;
+        let payload = &self[(EthHdr::LEN + Ipv4Hdr::LEN + TcpHdr::LEN)..];
 
-    #[inline]
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+        calc_tcp_checksum(src_ip, dst_ip, tcp_header.as_bytes(), payload).map_err(Into::into)
     }
 }
