@@ -1,3 +1,6 @@
+//! This is a minimal set of type definitions/helpers for common network types,
+//! so one does not need to depend on eg. network-types which lacks comments
+
 use super::{Pod, csum};
 use std::{
     fmt,
@@ -992,97 +995,6 @@ impl TcpHeaders {
         packet.write(offset, self.tcp)?;
 
         Ok(())
-    }
-
-    /// Given an already calculated checksum for the data payload, or 0 if using
-    /// tx checksum offload, checksums the pseudo IP and TCP header
-    #[inline]
-    pub fn calc_checksum(&mut self, length: usize, data_checksum: u32) -> u16 {
-        self.data_length = length;
-
-        let mut sum = data_checksum as u64;
-        let data_len = self.data_length + TcpHdr::LEN;
-
-        match &self.ip {
-            IpHdr::V4(v4) => {
-                // https://en.wikipedia.org/wiki/Transmission_Control_Protocol#IPv4_pseudo_header
-                // SAFETY: asm
-                unsafe {
-                    std::arch::asm!(
-                        "addq {pseudo_tcp}, {sum}",
-                        "adcq {saddr}, {sum}",
-                        "adcq {daddr}, {sum}",
-                        "adcq 0*8({tcp}), {sum}",
-                        "adcq $0, {sum}",
-                        pseudo_tcp = in(reg) ((data_len + IpProto::Tcp as usize) as u64).to_be(),
-                        saddr = in(reg) (v4.source.host() as u64).to_be(),
-                        daddr = in(reg) (v4.destination.host() as u64).to_be(),
-                        tcp = in(reg) &TcpHdr {
-                            source: self.tcp.source,
-                            destination: self.tcp.destination,
-                            sequence_number: self.tcp.sequence_number,
-                            acknowledgment_number: self.tcp.acknowledgment_number,
-                            data_offset: self.tcp.data_offset,
-                            flags: self.tcp.flags,
-                            window_size: self.tcp.window_size,
-                            checksum: 0,
-                            urgent_pointer: self.tcp.urgent_pointer,
-                            options: [],
-                        },
-                        sum = inout(reg) sum,
-                        options(att_syntax)
-                    );
-                }
-            }
-            IpHdr::V6(v6) => {
-                // https://en.wikipedia.org/wiki/Transmission_Control_Protocol#IPv6_pseudo_header
-                // SAFETY: asm
-                unsafe {
-                    let source = v6.source;
-                    let destination = v6.destination;
-
-                    std::arch::asm!(
-                        "addq {pseudo_tcp}, {sum}",
-                        "adcq 0*8({saddr}), {sum}",
-                        "adcq 1*8({saddr}), {sum}",
-                        "adcq 0*8({daddr}), {sum}",
-                        "adcq 1*8({daddr}), {sum}",
-                        "adcq 0*8({tcp}), {sum}",
-                        "adcq $0, {sum}",
-                        pseudo_tcp = in(reg) ((data_len + IpProto::Tcp as usize) as u64).to_be(),
-                        saddr = in(reg) source.as_ptr(),
-                        daddr = in(reg) destination.as_ptr(),
-                        tcp = in(reg) &TcpHdr {
-                            source: self.tcp.source,
-                            destination: self.tcp.destination,
-                            sequence_number: self.tcp.sequence_number,
-                            acknowledgment_number: self.tcp.acknowledgment_number,
-                            data_offset: self.tcp.data_offset,
-                            flags: self.tcp.flags,
-                            window_size: self.tcp.window_size,
-                            checksum: 0,
-                            urgent_pointer: self.tcp.urgent_pointer,
-                            options: [],
-                        },
-                        sum = inout(reg) sum,
-                        options(att_syntax)
-                    );
-                }
-            }
-        }
-
-        self.tcp.checksum = csum::fold_checksum(csum::finalize(sum));
-
-        // If the checksum calculation results in the value zero (all 16 bits 0)
-        // it should be sent as the ones' complement (all 1s) as a zero-value
-        // checksum indicates no checksum has been calculated.[7] In this case,
-        // any specific processing is not required at the receiver, because all
-        // 0s and all 1s are equal to zero in 1's complement arithmetic.
-        if self.tcp.checksum == 0 {
-            self.tcp.checksum = 0xffff;
-        }
-
-        self.tcp.checksum
     }
 }
 

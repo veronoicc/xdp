@@ -68,7 +68,7 @@ pub fn diff(from: &[u8], to: &[u8], seed: u32) -> u16 {
 /// Reduces the intermediate 64-bit sum to 32-bits that can be fed into
 /// further calculations
 #[inline]
-fn finalize(sum: u64) -> u32 {
+pub fn finalize(sum: u64) -> u32 {
     (sum.overflowing_add(sum.rotate_right(32)).0 >> 32) as u32
 }
 
