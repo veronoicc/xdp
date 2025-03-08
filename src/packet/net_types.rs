@@ -340,7 +340,7 @@ impl fmt::Debug for UdpHdr {
 /// The [TCP](https://en.wikipedia.org/wiki/Transmission_Control_Protocol) header
 #[derive(Copy, Clone)]
 #[repr(C)]
-pub struct TcpHdr {
+pub struct TcpHdr<const N: usize = 0> {
     /// The source port of the sender
     pub source: NetworkU16,
     /// The destination port
@@ -360,7 +360,7 @@ pub struct TcpHdr {
     /// If the URG flag is set, this field indicates the offset from the sequence number where the urgent data ends
     pub urgent_pointer: NetworkU16,
     /// Options
-    pub options: [u8; 0],
+    pub options: [u8; N],
 }
 
 len!(TcpHdr);
