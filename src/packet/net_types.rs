@@ -359,6 +359,8 @@ pub struct TcpHdr {
     pub check: u16,
     /// The urgent pointer
     pub urg_ptr: NetworkU16,
+    /// Options
+    pub options: [u8; 40],
 }
 
 len!(TcpHdr);
@@ -377,6 +379,7 @@ impl TcpHdr {
             window: self.window,
             check: self.check,
             urg_ptr: self.urg_ptr,
+            options: self.options,
         }
     }
 }
@@ -394,6 +397,7 @@ impl fmt::Debug for TcpHdr {
             .field("window", &self.window)
             .field("check", &format_args!("{:04x}", self.check))
             .field("urg_ptr", &self.urg_ptr)
+            .field("options", &self.options)
             .finish()
     }
 }
@@ -1010,6 +1014,7 @@ mod test {
             window: 0.into(),
             check: 0,
             urg_ptr: 0.into(),
+            options: [0; 40],
         };
 
         assert_eq!(tcp_hdr.source.host(), 12345);
@@ -1049,6 +1054,7 @@ mod test {
             window: 0.into(),
             check: 0,
             urg_ptr: 0.into(),
+            options: [0; 40],
         };
 
         packet.write(0, eth_hdr).unwrap();

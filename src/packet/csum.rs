@@ -163,7 +163,7 @@ impl<const N: usize> Buf<N> {
         }
 
         let p =
-            // SAFETY: we've validated we'll only read within bounds
+            // SAFETY: we've validated the pointer read is within bounds
             unsafe { std::ptr::read_unaligned(self.buf.as_ptr().byte_offset(*off as _).cast()) };
         *off += P::size();
         Ok(p)
@@ -176,7 +176,7 @@ impl<const N: usize> Buf<N> {
             "this indicates a bug in the netlink code, please file an issue"
         );
 
-        // SAFETY: we've validated we'll only write within bounds
+        // SAFETY: we've validated the pointer write is within bounds
         unsafe {
             std::ptr::write_unaligned(self.buf.as_mut_ptr().byte_offset(*off as _).cast(), item);
         };
@@ -578,5 +578,91 @@ impl super::NicIndex {
         };
 
         Ok(caps)
+    }
+}
+
+pub fn partial(buf: &[u8], initial: u32) -> u32 {
+    let mut sum = initial;
+    let mut i = 0;
+
+    while i < buf.len() {
+        let word = if i + 1 < buf.len() {
+            u16::from_be_bytes([buf[i], buf[i + 1]]) as u32
+        } else {
+            (buf[i] as u32) << 8
+        };
+
+        sum = sum.wrapping_add(word);
+        i += 2;
+    }
+
+    sum
+}
+
+pub fn fold_checksum(sum: u32) -> u16 {
+    let mut sum = sum;
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+pub fn calc_tcp_checksum(
+    src_ip: &[u8],
+    dst_ip: &[u8],
+    tcp_header: &[u8],
+    payload: &[u8],
+) -> Result<u16> {
+    if src_ip.len() != dst_ip.len() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Source and destination IP addresses must have the same length",
+        ));
+    }
+
+    let mut sum = 0u32;
+
+    // Pseudo-header
+    sum = partial(src_ip, sum);
+    sum = partial(dst_ip, sum);
+    sum = partial(&[0, IpProto::Tcp as u8], sum);
+    sum = partial(&(tcp_header.len() as u16).to_be_bytes(), sum);
+
+    // TCP header and payload
+    sum = partial(tcp_header, sum);
+    sum = partial(payload, sum);
+
+    Ok(fold_checksum(sum))
+}
+
+#[derive(Debug)]
+pub enum TcpCalcError {
+    InvalidInput(String),
+    IoError(Error),
+}
+
+impl From<Error> for TcpCalcError {
+    fn from(err: Error) -> Self {
+        TcpCalcError::IoError(err)
+    }
+}
+
+impl std::fmt::Display for TcpCalcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TcpCalcError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
+            TcpCalcError::IoError(err) => write!(f, "IO error: {}", err),
+        }
+    }
+}
+
+impl std::error::Error for TcpCalcError {}
+
+impl super::Packet {
+    pub fn calc_tcp_checksum(&self, src_ip: &[u8], dst_ip: &[u8]) -> Result<u16, TcpCalcError> {
+        let tcp_header = self.read::<TcpHdr>(EthHdr::LEN + Ipv4Hdr::LEN)?;
+        let payload = &self[(EthHdr::LEN + Ipv4Hdr::LEN + TcpHdr::LEN)..];
+
+        calc_tcp_checksum(src_ip, dst_ip, tcp_header.as_bytes(), payload).map_err(Into::into)
     }
 }
