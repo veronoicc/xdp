@@ -281,7 +281,7 @@ impl super::Packet {
     /// calculate the partial (pseudo header + UDP header) checksum, and configure
     /// the TX metadata for the packet so that the data checksum will be calculated
     /// by the NIC that sends the packet
-    pub fn calc_transport_checksum(&mut self) -> Result<u16, TransportCalcError> {
+    pub fn calc_udp_checksum(&mut self) -> Result<u16, TransportCalcError> {
         use crate::packet::Pod as _;
         use nt::*;
 
@@ -394,6 +394,106 @@ impl super::Packet {
             udp_hdr.check = csum;
 
             self.write(offset, udp_hdr)?;
+
+            csum
+        };
+
+        Ok(checksum)
+    }
+
+    /// Performs a full calculation of the TCP header checksum.
+    ///
+    /// This method is here for convenience, but it might be better in some
+    /// scenarios to use a running checksum calculation like [`partial`] or [`diff`]
+    ///
+    /// This method takes TX checksum offload into account, and will only
+    /// calculate the partial (pseudo header + TCP header) checksum, and configure
+    /// the TX metadata for the packet so that the data checksum will be calculated
+    /// by the NIC that sends the packet
+    pub fn calc_tcp_checksum(&mut self) -> Result<u16, TransportCalcError> {
+        use crate::packet::Pod as _;
+        use nt::*;
+
+        let mut offset = 0;
+        let eth = self.read::<EthHdr>(offset)?;
+        offset += EthHdr::LEN;
+
+        let (pseudo_seed, mut tcp_hdr) = match eth.ether_type {
+            EtherType::Ipv4 => {
+                let ipv4 = self.read::<Ipv4Hdr>(offset)?;
+                debug_assert_eq!(
+                    ipv4.internet_header_length(),
+                    Ipv4Hdr::LEN as u8,
+                    "ipv4 options are not supported"
+                );
+                offset += Ipv4Hdr::LEN;
+
+                match ipv4.proto {
+                    IpProto::Tcp => {
+                        let tcp_hdr = self.read::<TcpHdr>(offset)?;
+                        let pseudo_seed = calculate_ipv4_pseudo_header_checksum(
+                            ipv4,
+                            (self.len() - offset) as u32 + IpProto::Tcp as u32,
+                        );
+                        (pseudo_seed, tcp_hdr)
+                    }
+                    proto => return Err(TransportCalcError::NotTcp(proto)),
+                }
+            }
+            EtherType::Ipv6 => {
+                let ipv6 = self.read::<Ipv6Hdr>(offset)?;
+                offset += Ipv6Hdr::LEN;
+
+                match ipv6.next_header {
+                    IpProto::Tcp => {
+                        let tcp_hdr = self.read::<TcpHdr>(offset)?;
+                        let pseudo_seed = calculate_ipv6_pseudo_header_checksum(
+                            ipv6,
+                            (self.len() - offset) as u32 + IpProto::Tcp as u32,
+                        );
+                        (pseudo_seed, tcp_hdr)
+                    }
+                    proto => return Err(TransportCalcError::NotTcp(proto)),
+                }
+            }
+            invalid => return Err(TransportCalcError::NotIp(invalid)),
+        };
+
+        let checksum = if self.can_offload_checksum() {
+            let csum = fold_checksum(pseudo_seed);
+            tcp_hdr.checksum = !csum;
+            self.write(offset, tcp_hdr)?;
+
+            self.set_tx_metadata(
+                crate::packet::CsumOffload::Request {
+                    start: offset as u16,
+                    offset: std::mem::offset_of!(TcpHdr, checksum) as u16,
+                },
+                false,
+            )?;
+
+            csum
+        } else {
+            tcp_hdr.checksum = 0;
+            let sum = partial(tcp_hdr.as_bytes(), pseudo_seed);
+
+            let data_offset = offset + TcpHdr::LEN;
+            let data_payload = &self[data_offset..self.len()];
+
+            let mut csum = fold_checksum(partial(data_payload, sum));
+
+            // If the checksum calculation results in the value zero (all 16 bits 0)
+            // it should be sent as the ones' complement (all 1s) as a zero-value
+            // checksum indicates no checksum has been calculated.[7] In this case,
+            // any specific processing is not required at the receiver, because all
+            // 0s and all 1s are equal to zero in 1's complement arithmetic.
+            if csum == 0 {
+                csum = 0xffff;
+            }
+
+            tcp_hdr.checksum = csum;
+
+            self.write(offset, tcp_hdr)?;
 
             csum
         };

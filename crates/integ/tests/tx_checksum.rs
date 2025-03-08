@@ -202,7 +202,7 @@ fn do_checksum_test(software: bool, vpair: &VethPair) {
             new.set_packet_headers(&mut packet, true).unwrap();
             println!(
                 "partial checksum: {:04x}",
-                packet.calc_udp_checksum().unwrap()
+                packet.calc_tcp_checksum().unwrap()
             );
 
             slab.push_front(packet);
