@@ -4,7 +4,6 @@ use xdp::{
     slab::Slab,
     socket::*,
     umem::*,
-    *,
 };
 
 /// Validates that we can offload (most of) the layer 4 checksum calculation to

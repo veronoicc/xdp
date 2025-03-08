@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(clippy::missing_safety_doc)]
 //! Utitlities for calculating [internet checksums](https://en.wikipedia.org/wiki/Internet_checksum)
 
 /// Folds a running checksum calculation to a 16-bit value appropriate for use
@@ -221,7 +221,7 @@ pub fn partial(mut buf: &[u8], sum: u32) -> u32 {
 
 use crate::packet::net_types as nt;
 
-/// Errors that can occur during transport checksum calculation
+/// Errors that can occur during UDP checksum calculation
 #[derive(Debug)]
 pub enum TransportCalcError {
     /// Not an IP packet
@@ -272,13 +272,13 @@ impl From<super::PacketError> for TransportCalcError {
 }
 
 impl super::Packet {
-    /// Performs a full calculation of the transport header checksum (UDP or TCP).
+    /// Performs a full calculation of the UDP header checksum.
     ///
     /// This method is here for convenience, but it might be better in some
     /// scenarios to use a running checksum calculation like [`partial`] or [`diff`]
     ///
     /// This method takes TX checksum offload into account, and will only
-    /// calculate the partial (pseudo header + transport header) checksum, and configure
+    /// calculate the partial (pseudo header + UDP header) checksum, and configure
     /// the TX metadata for the packet so that the data checksum will be calculated
     /// by the NIC that sends the packet
     pub fn calc_transport_checksum(&mut self) -> Result<u16, TransportCalcError> {
@@ -289,7 +289,7 @@ impl super::Packet {
         let eth = self.read::<EthHdr>(offset)?;
         offset += EthHdr::LEN;
 
-        let (pseudo_seed, mut transport_hdr, is_udp) = match eth.ether_type {
+        let (pseudo_seed, mut udp_hdr) = match eth.ether_type {
             EtherType::Ipv4 => {
                 let ipv4 = self.read::<Ipv4Hdr>(offset)?;
                 debug_assert_eq!(
@@ -299,36 +299,61 @@ impl super::Packet {
                 );
                 offset += Ipv4Hdr::LEN;
 
-                match ipv4.proto {
-                    IpProto::Udp => {
-                        let udp_hdr = self.read::<UdpHdr>(offset)?;
-                        let pseudo_seed = calculate_ipv4_pseudo_header_checksum(ipv4, (self.len() - offset) as u32 + IpProto::Udp as u32);
-                        (pseudo_seed, udp_hdr, true)
-                    }
-                    IpProto::Tcp => {
-                        let tcp_hdr = self.read::<TcpHdr>(offset)?;
-                        let pseudo_seed = calculate_ipv4_pseudo_header_checksum(ipv4, (self.len() - offset) as u32 + IpProto::Tcp as u32);
-                        (pseudo_seed, tcp_hdr, false)
-                    }
-                    proto => return Err(TransportCalcError::NotUdp(proto)),
+                if ipv4.proto != IpProto::Udp {
+                    return Err(TransportCalcError::NotUdp(ipv4.proto));
+                }
+
+                let udp_hdr = self.read::<UdpHdr>(offset)?;
+
+                // https://en.wikipedia.org/wiki/User_Datagram_Protocol#IPv4_pseudo_header
+                // SAFETY: asm
+                unsafe {
+                    let mut sum = 0;
+
+                    std::arch::asm!(
+                        "addl {saddr:e}, {sum:e}",
+                        "adcl {daddr:e}, {sum:e}",
+                        "adcl {pseudo:e}, {sum:e}",
+                        "adcl $0, {sum:e}",
+                        saddr = in(reg) ipv4.source.0,
+                        daddr = in(reg) ipv4.destination.0,
+                        pseudo = in(reg) (udp_hdr.length.host() as u32 + IpProto::Udp as u32) << 8,
+                        sum = inout(reg) sum,
+                        options(att_syntax)
+                    );
+
+                    (sum, udp_hdr)
                 }
             }
             EtherType::Ipv6 => {
                 let ipv6 = self.read::<Ipv6Hdr>(offset)?;
                 offset += Ipv6Hdr::LEN;
 
-                match ipv6.next_header {
-                    IpProto::Udp => {
-                        let udp_hdr = self.read::<UdpHdr>(offset)?;
-                        let pseudo_seed = calculate_ipv6_pseudo_header_checksum(ipv6, (self.len() - offset) as u32 + IpProto::Udp as u32);
-                        (pseudo_seed, udp_hdr, true)
-                    }
-                    IpProto::Tcp => {
-                        let tcp_hdr = self.read::<TcpHdr>(offset)?;
-                        let pseudo_seed = calculate_ipv6_pseudo_header_checksum(ipv6, (self.len() - offset) as u32 + IpProto::Tcp as u32);
-                        (pseudo_seed, tcp_hdr, false)
-                    }
-                    proto => return Err(TransportCalcError::NotUdp(proto)),
+                if ipv6.next_header != IpProto::Udp {
+                    return Err(TransportCalcError::NotUdp(ipv6.next_header));
+                }
+
+                let udp_hdr = self.read::<UdpHdr>(offset)?;
+
+                // https://en.wikipedia.org/wiki/User_Datagram_Protocol#IPv6_pseudo_header
+                // SAFETY: asm
+                unsafe {
+                    let mut sum = ((udp_hdr.length.host() as u32).to_be() as u64)
+                        .wrapping_add((IpProto::Udp as u64).to_be());
+
+                    std::arch::asm!(
+                        "addq 0*8({saddr}), {sum}",
+                        "adcq 1*8({saddr}), {sum}",
+                        "adcq 0*8({daddr}), {sum}",
+                        "adcq 1*8({daddr}), {sum}",
+                        "adcq $0, {sum}",
+                        saddr = in(reg) ipv6.source.as_ptr(),
+                        daddr = in(reg) ipv6.destination.as_ptr(),
+                        sum = inout(reg) sum,
+                        options(att_syntax)
+                    );
+
+                    (finalize(sum), udp_hdr)
                 }
             }
             invalid => return Err(TransportCalcError::NotIp(invalid)),
@@ -336,79 +361,41 @@ impl super::Packet {
 
         let checksum = if self.can_offload_checksum() {
             let csum = fold_checksum(pseudo_seed);
-            if is_udp {
-                let udp_hdr = transport_hdr.downcast_mut::<UdpHdr>().unwrap();
-                udp_hdr.check = !csum;
-                self.write(offset, *udp_hdr)?;
-            } else {
-                let tcp_hdr = transport_hdr.downcast_mut::<TcpHdr>().unwrap();
-                tcp_hdr.checksum = !csum;
-                self.write(offset, *tcp_hdr)?;
-            }
+            udp_hdr.check = !csum;
+            self.write(offset, udp_hdr)?;
 
             self.set_tx_metadata(
                 crate::packet::CsumOffload::Request {
                     start: offset as u16,
-                    offset: if is_udp {
-                        std::mem::offset_of!(UdpHdr, check) as u16
-                    } else {
-                        std::mem::offset_of!(TcpHdr, checksum) as u16
-                    },
+                    offset: std::mem::offset_of!(UdpHdr, check) as u16,
                 },
                 false,
             )?;
 
             csum
         } else {
-            if is_udp {
-                let udp_hdr = transport_hdr.downcast_mut::<UdpHdr>().unwrap();
-                udp_hdr.check = 0;
-                let sum = partial(udp_hdr.as_bytes(), pseudo_seed);
+            udp_hdr.check = 0;
+            let sum = partial(udp_hdr.as_bytes(), pseudo_seed);
 
-                let data_offset = offset + nt::UdpHdr::LEN;
-                let data_payload = &self[data_offset..self.len()];
+            let data_offset = offset + nt::UdpHdr::LEN;
+            let data_payload = &self[data_offset..self.len()];
 
-                let mut csum = fold_checksum(partial(data_payload, sum));
+            let mut csum = fold_checksum(partial(data_payload, sum));
 
-                // If the checksum calculation results in the value zero (all 16 bits 0)
-                // it should be sent as the ones' complement (all 1s) as a zero-value
-                // checksum indicates no checksum has been calculated.[7] In this case,
-                // any specific processing is not required at the receiver, because all
-                // 0s and all 1s are equal to zero in 1's complement arithmetic.
-                if csum == 0 {
-                    csum = 0xffff;
-                }
-
-                udp_hdr.check = csum;
-
-                self.write(offset, *udp_hdr)?;
-
-                csum
-            } else {
-                let tcp_hdr = transport_hdr.downcast_mut::<TcpHdr>().unwrap();
-                tcp_hdr.checksum = 0;
-                let sum = partial(tcp_hdr.as_bytes(), pseudo_seed);
-
-                let data_offset = offset + nt::TcpHdr::LEN;
-                let data_payload = &self[data_offset..self.len()];
-
-                let mut csum = fold_checksum(partial(data_payload, sum));
-
-                // If the checksum calculation results in the value zero (all 16 bits 0)
-                // it should be sent as the ones' complement (all 1s) as a zero-value
-                // checksum indicates no checksum has been calculated.[7] In this case,
-                // any specific processing is not required at the receiver, because all
-                // 0s and all 1s are equal to zero in 1's complement arithmetic.
-                if csum == 0 {
-                    csum = 0xffff;
-                }
-
-                tcp_hdr.checksum = csum;
-
-                self.write(offset, *tcp_hdr)?;
-
-                csum
+            // If the checksum calculation results in the value zero (all 16 bits 0)
+            // it should be sent as the ones' complement (all 1s) as a zero-value
+            // checksum indicates no checksum has been calculated.[7] In this case,
+            // any specific processing is not required at the receiver, because all
+            // 0s and all 1s are equal to zero in 1's complement arithmetic.
+            if csum == 0 {
+                csum = 0xffff;
             }
+
+            udp_hdr.check = csum;
+
+            self.write(offset, udp_hdr)?;
+
+            csum
         };
 
         Ok(checksum)
@@ -587,4 +574,48 @@ impl nt::TcpHeaders {
 
         self.tcp.checksum
     }
+}
+
+/// Calculates the IPv6 pseudo-header checksum for TCP
+pub fn calculate_ipv6_pseudo_header_checksum(ipv6: nt::Ipv6Hdr, tcp_length: u32) -> u32 {
+    let mut sum = (tcp_length.to_be() as u64).wrapping_add((nt::IpProto::Tcp as u64).to_be());
+
+    // SAFETY: asm
+    unsafe {
+        std::arch::asm!(
+            "addq 0*8({saddr}), {sum}",
+            "adcq 1*8({saddr}), {sum}",
+            "adcq 0*8({daddr}), {sum}",
+            "adcq 1*8({daddr}), {sum}",
+            "adcq $0, {sum}",
+            saddr = in(reg) ipv6.source.as_ptr(),
+            daddr = in(reg) ipv6.destination.as_ptr(),
+            sum = inout(reg) sum,
+            options(att_syntax)
+        );
+    }
+
+    finalize(sum)
+}
+
+/// Calculates the IPv4 pseudo-header checksum for TCP
+pub fn calculate_ipv4_pseudo_header_checksum(ipv4: nt::Ipv4Hdr, tcp_length: u32) -> u32 {
+    let mut sum = 0;
+
+    // SAFETY: asm
+    unsafe {
+        std::arch::asm!(
+            "addl {saddr:e}, {sum:e}",
+            "adcl {daddr:e}, {sum:e}",
+            "adcl {pseudo:e}, {sum:e}",
+            "adcl $0, {sum:e}",
+            saddr = in(reg) ipv4.source.0,
+            daddr = in(reg) ipv4.destination.0,
+            pseudo = in(reg) (tcp_length + nt::IpProto::Tcp as u32) << 8,
+            sum = inout(reg) sum,
+            options(att_syntax)
+        );
+    }
+
+    sum
 }
