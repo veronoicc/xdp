@@ -252,7 +252,7 @@ impl Umem {
     }
 
     #[inline]
-    pub(crate) fn available(&mut self) -> &mut VecDeque<u64> {
+    pub fn available(&mut self) -> &mut VecDeque<u64> {
         &mut self.available
     }
 }
