@@ -23,7 +23,7 @@ pub trait Slab {
 /// This is allocated on the heap, but will _not_ grow, and is intended to be
 /// allocated once before entering an I/O loop
 pub struct HeapSlab {
-    vd: std::collections::VecDeque<Packet>,
+    pub vd: std::collections::VecDeque<Packet>,
 }
 
 impl HeapSlab {
@@ -178,33 +178,3 @@ macro_rules! slab {
 }
 
 slab!(StackSlab, usize);
-
-struct SlabIter<'a, S> {
-    slab: &'a mut S,
-    index: usize,
-}
-
-impl<'a, S> Iterator for SlabIter<'a, S>
-where
-    S: Slab,
-{
-    type Item = Packet;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let item = self.slab.get(self.index);
-        self.index += 1;
-        item
-    }
-}
-
-impl<'a> From<&'a mut HeapSlab> for SlabIter<'a, HeapSlab> {
-    fn from(slab: &'a mut HeapSlab) -> Self {
-        Self { slab, index: 0 }
-    }
-}
-
-impl<'a, const N: usize> From<&'a mut StackSlab<N>> for SlabIter<'a, StackSlab<N>> {
-    fn from(slab: &'a mut StackSlab<N>) -> Self {
-        Self { slab, index: 0 }
-    }
-}
