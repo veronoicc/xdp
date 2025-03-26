@@ -172,6 +172,38 @@ impl Umem {
         }
     }
 
+    // Alloc many
+    /// Given a number of packets to allocate, returns a [`Vec`] of [`Packet`]s
+    /// that were successfully allocated
+    /// 
+    /// # Safety
+    ///
+    /// The [`Packet`]s returned by this function are pointing to memory owned by
+    /// this [`Umem`], it must not outlive this [`Umem`]
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// let mut umem = xdp::Umem::map(xdp::umem::UmemCfgBuilder::default().build().expect("failed to build umem cfg")).expect("failed to map memory");
+    /// 
+    /// unsafe {
+    ///    let packets = umem.alloc_many(2);
+    ///   assert_eq!(packets.len(), 2);
+    ///  assert!(packets.iter().all(|packet| packet.is_empty()));
+    /// }
+    /// ```
+    pub unsafe fn alloc_many(&mut self, count: usize) -> Vec<Packet> {
+        let mut packets = Vec::with_capacity(count);
+        for _ in 0..count {
+            if let Some(packet) = unsafe { self.alloc() } {
+                packets.push(packet);
+            } else {
+                break;
+            }
+        }
+        packets
+    }
+
     /// Given an address offset, adds the packet it points to to the free list
     ///
     /// This function assumes that frames are power of 2, and thus it doesn't
