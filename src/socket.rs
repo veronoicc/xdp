@@ -154,7 +154,11 @@ impl XdpSocketBuilder {
         let socket = self.sock.as_raw_fd();
 
         // Setup the rings now that we have our offsets
-        let fill_ring = rings::FillRing::new(socket, &cfg, &offsets)?;
+        let fill_ring = if cfg.fill_count > 0 {
+            Some(rings::FillRing::new(socket, &cfg, &offsets)?)
+        } else {
+            None
+        };
 
         let rx_ring = if cfg.rx_count > 0 {
             Some(rings::RxRing::new(socket, &cfg, &offsets)?)
@@ -162,7 +166,12 @@ impl XdpSocketBuilder {
             None
         };
 
-        let completion_ring = rings::CompletionRing::new(socket, &cfg, &offsets)?;
+        let completion_ring = if cfg.completion_count > 0 {
+            Some(rings::CompletionRing::new(socket, &cfg, &offsets)?)
+        } else {
+            None
+        };
+
         let tx_ring = if cfg.tx_count > 0 {
             Some(rings::TxRing::new(socket, &cfg, &offsets)?)
         } else {
@@ -192,7 +201,11 @@ impl XdpSocketBuilder {
         let socket = self.sock.as_raw_fd();
 
         // Setup the rings now that we have our offsets
-        let fill_ring = rings::WakableFillRing::new(socket, &cfg, &offsets)?;
+        let fill_ring = if cfg.fill_count > 0 {
+            Some(rings::WakableFillRing::new(socket, &cfg, &offsets)?)
+        } else {
+            None
+        };
 
         let rx_ring = if cfg.rx_count > 0 {
             Some(rings::RxRing::new(socket, &cfg, &offsets)?)
@@ -200,7 +213,12 @@ impl XdpSocketBuilder {
             None
         };
 
-        let completion_ring = rings::CompletionRing::new(socket, &cfg, &offsets)?;
+        let completion_ring = if cfg.completion_count > 0 {
+            Some(rings::CompletionRing::new(socket, &cfg, &offsets)?)
+        } else {
+            None
+        };
+
         let tx_ring = if cfg.tx_count > 0 {
             Some(rings::WakableTxRing::new(socket, &cfg, &offsets)?)
         } else {

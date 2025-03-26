@@ -284,6 +284,7 @@ impl Umem {
     }
 
     #[inline]
+    #[allow(missing_docs)]
     pub fn available(&mut self) -> &mut VecDeque<u64> {
         &mut self.available
     }

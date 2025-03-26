@@ -18,27 +18,6 @@ use crate::libc::rings as libc;
 pub const XSK_RING_PROD_DEFAULT_NUM_DESCS: u32 = 2048;
 pub const XSK_RING_CONS_DEFAULT_NUM_DESCS: u32 = 2048;
 
-macro_rules! non_zero_and_power_of_2 {
-    ($ctx:expr, $name:ident) => {{
-        let val = $ctx.$name;
-        if val == 0 {
-            return Err($crate::error::ConfigError {
-                name: stringify!($name),
-                kind: $crate::error::ConfigErrorKind::Zero,
-            }
-            .into());
-        } else if !val.is_power_of_two() {
-            return Err($crate::error::ConfigError {
-                name: stringify!($name),
-                kind: $crate::error::ConfigErrorKind::NonPowerOf2,
-            }
-            .into());
-        }
-
-        val
-    }};
-}
-
 macro_rules! zero_or_power_of_2 {
     ($ctx:expr, $name:ident) => {{
         let val = $ctx.$name;
@@ -101,8 +80,8 @@ impl RingConfigBuilder {
             .into());
         }
 
-        let fill_count = non_zero_and_power_of_2!(self, fill_count);
-        let completion_count = non_zero_and_power_of_2!(self, completion_count);
+        let fill_count = zero_or_power_of_2!(self, fill_count);
+        let completion_count = zero_or_power_of_2!(self, completion_count);
         let rx_count = zero_or_power_of_2!(self, rx_count);
         let tx_count = zero_or_power_of_2!(self, tx_count);
 
@@ -132,11 +111,11 @@ pub struct RingConfig {
 pub struct Rings {
     /// The ring used by userspace to inform the kernel of memory addresses that
     /// you wish it to fill with packet received on the bound NIC
-    pub fill_ring: FillRing,
+    pub fill_ring: Option<FillRing>,
     /// The ring used by the kernel to place packets that have finished receiving
     pub rx_ring: Option<RxRing>,
     /// The ring used by the kernel to inform userspace when packets have finished sending
-    pub completion_ring: CompletionRing,
+    pub completion_ring: Option<CompletionRing>,
     /// The ring used by userspace to enqueue packets to be sent on the bound NIC
     pub tx_ring: Option<TxRing>,
 }
@@ -145,11 +124,11 @@ pub struct Rings {
 pub struct WakableRings {
     /// The ring used by userspace to inform the kernel of memory addresses that
     /// you wish it to fill with packet received on the bound NIC
-    pub fill_ring: WakableFillRing,
+    pub fill_ring: Option<WakableFillRing>,
     /// The ring used by the kernel to place packets that have finished receiving
     pub rx_ring: Option<RxRing>,
     /// The ring used by the kernel to inform userspace when packets have finished sending
-    pub completion_ring: CompletionRing,
+    pub completion_ring: Option<CompletionRing>,
     /// The ring used by userspace to enqueue packets to be sent on the bound NIC
     pub tx_ring: Option<WakableTxRing>,
 }
