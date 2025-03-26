@@ -14,6 +14,8 @@ pub trait Slab {
     fn push_front(&mut self, packet: Packet) -> Option<Packet>;
     /// Pops the back packet if any
     fn pop_back(&mut self) -> Option<Packet>;
+    /// Gets the packet at the specified index
+    fn get(&mut self, index: usize) -> Option<Packet>;
 }
 
 // A heap allocated slab, using [`std::collections::VecDequeue`]
@@ -68,6 +70,12 @@ impl Slab for HeapSlab {
         } else {
             Some(item)
         }
+    }
+
+    /// Gets the packet at the specified index
+    #[inline]
+    fn get(&mut self, index: usize) -> Option<Packet> {
+        self.vd.get(index).copied()
     }
 }
 
@@ -139,7 +147,7 @@ macro_rules! slab {
 
                 let index = self.read as usize % N;
                 self.read = self.read.wrapping_add(1);
-                Some(self.ring[index].inner_copy())
+                Some(self.ring[index].clone())
             }
 
             /// Pushes a packet to the front, returning `Some` if the slab is at capacity
@@ -153,6 +161,17 @@ macro_rules! slab {
                 } else {
                     Some(item)
                 }
+            }
+
+            /// Gets the packet at the specified index
+            #[inline]
+            fn get(&mut self, index: usize) -> Option<$crate::Packet> {
+                if index >= self.len() {
+                    return None;
+                }
+
+                let index = (self.read as usize + index) % N;
+                Some(self.ring[index].inner_copy())
             }
         }
     };
