@@ -278,8 +278,16 @@ impl XdpSocketBuilder {
 
         // Configure the umem region for the socket
         self.set_sockopt(OptName::UmemRegion, &umem_reg)?;
-        self.set_sockopt(OptName::UmemFillRing, &cfg.fill_count)?;
-        self.set_sockopt(OptName::UmemCompletionRing, &cfg.completion_count)?;
+
+        // Configure the fill ring
+        if cfg.fill_count > 0 {
+            self.set_sockopt(OptName::UmemFillRing, &cfg.fill_count)?;
+        }
+
+        // Configure the completion ring
+        if cfg.completion_count > 0 {
+            self.set_sockopt(OptName::UmemCompletionRing, &cfg.completion_count)?;
+        }
 
         // Configure the recv rings
         if cfg.rx_count > 0 {
