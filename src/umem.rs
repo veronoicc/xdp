@@ -204,6 +204,33 @@ impl Umem {
         packets
     }
 
+    /// Allocates packets from the [`Umem`] into the provided [`Vec`], appending the allocated packets to it.
+    ///
+    /// # Safety
+    ///
+    /// The [`Packet`]s appended to the provided vector are pointing to memory owned by this [`Umem`], and they must not outlive this [`Umem`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut umem = xdp::Umem::map(xdp::umem::UmemCfgBuilder::default().build().expect("failed to build umem cfg")).expect("failed to map memory");
+    ///
+    /// let mut packets = Vec::new();
+    /// unsafe {
+    ///     umem.alloc_into_vec(&mut packets, 2);
+    ///     assert_eq!(packets.len(), 2);
+    /// }
+    /// ```
+    pub unsafe fn alloc_into_vec(&mut self, packets: &mut Vec<Packet>, count: usize) {
+        for _ in 0..count {
+            if let Some(packet) = unsafe { self.alloc() } {
+                packets.push(packet);
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Given an address offset, adds the packet it points to to the free list
     ///
     /// This function assumes that frames are power of 2, and thus it doesn't
@@ -284,6 +311,9 @@ impl Umem {
     }
 
     #[inline]
+    /// Returns a mutable reference to the deque of available addresses.
+    ///
+    /// This deque contains the addresses that can be used for packet allocation.
     pub fn available(&mut self) -> &mut VecDeque<u64> {
         &mut self.available
     }
