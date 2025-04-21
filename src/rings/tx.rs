@@ -8,7 +8,8 @@ use crate::{
 
 /// The ring used to enqueue packets for the kernel to send
 pub struct TxRing {
-    ring: super::XskProducer<libc::xdp::xdp_desc>,
+    #[allow(missing_docs)]
+    pub ring: super::XskProducer<libc::xdp::xdp_desc>,
     _mmap: crate::mmap::Mmap,
 }
 

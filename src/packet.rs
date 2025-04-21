@@ -145,6 +145,7 @@ pub enum CsumOffload {
 /// │               │                    │        │          │    
 ///  head            +14                  +34      +42        tail
 /// ```
+#[derive(Clone, Copy)]
 pub struct Packet {
     /// The entire packet buffer, including headroom, initialized packet contents,
     /// and uninitialized/empty remainder

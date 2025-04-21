@@ -2,14 +2,14 @@
 //! filled with data received on the NIC queue the ring is bound to
 
 use crate::{
-    Umem,
-    libc::{self, rings},
+    libc::{self, rings}, slab::Slab
 };
 
 /// The ring used to enqueue buffers for the kernel to fill in with packets
 /// received from a NIC
 pub struct FillRing {
-    ring: super::XskProducer<u64>,
+    #[allow(missing_docs)]
+    pub ring: super::XskProducer<libc::xdp::xdp_desc>,
     _mmap: crate::mmap::Mmap,
 }
 
@@ -39,7 +39,7 @@ impl FillRing {
         })
     }
 
-    /// Enqueues up to `num_packets` to be received and filled by the kernel
+    /// Enqueues `packets` to be received and filled by the kernel
     ///
     /// # Safety
     ///
@@ -47,12 +47,9 @@ impl FillRing {
     ///
     /// # Returns
     ///
-    /// The number of packets that were actually enqueued. This number can be
-    /// lower than the requested `num_packets` if the [`Umem`] didn't have enough
-    /// open slots, or the rx ring had insufficient capacity
-    pub unsafe fn enqueue(&mut self, umem: &mut Umem, num_packets: usize) -> usize {
-        let available = umem.available();
-        let requested = std::cmp::min(available.len(), num_packets);
+    /// The number of packets that were actually enqueued.
+    pub unsafe fn enqueue<S: Slab>(&mut self, packets: &mut S) -> usize {
+        let requested = packets.len();
         if requested == 0 {
             return 0;
         }
@@ -61,7 +58,11 @@ impl FillRing {
 
         if actual > 0 {
             for i in idx..idx + actual {
-                self.ring.set(i, available.pop_front().unwrap());
+                let Some(packet) = packets.pop_back() else {
+                    unreachable!()
+                };
+
+                self.ring.set(i, packet.into());
             }
 
             self.ring.submit(actual as _);
@@ -97,14 +98,13 @@ impl WakableFillRing {
     ///
     /// The [`Umem`] must outlive the `AF_XDP` socket
     #[inline]
-    pub unsafe fn enqueue(
+    pub unsafe fn enqueue<S: Slab>(
         &mut self,
-        umem: &mut Umem,
-        num_packets: usize,
+        packets: &mut S,
         wakeup: bool,
     ) -> std::io::Result<usize> {
         // SAFETY: FillRing::enqueue is unsafe
-        let queued = unsafe { self.inner.enqueue(umem, num_packets) };
+        let queued = unsafe { self.inner.enqueue(packets) };
 
         if queued > 0 && wakeup {
             // SAFETY: This is safe, even if the socket descriptor is invalid.

@@ -210,7 +210,7 @@ fn map_ring<T>(
 }
 
 /// Used for fill and tx rings where userspace is the producer
-struct XskProducer<T: 'static>(XskRing<T>);
+pub struct XskProducer<T: 'static>(XskRing<T>);
 
 impl<T> XskProducer<T> {
     #[inline]
@@ -263,7 +263,7 @@ impl<T> XskProducer<T> {
 }
 
 /// Used for rx and completion rings where userspace is the consumer
-struct XskConsumer<T: 'static>(XskRing<T>);
+pub struct XskConsumer<T: 'static>(XskRing<T>);
 
 impl<T: Copy> XskConsumer<T> {
     #[inline]

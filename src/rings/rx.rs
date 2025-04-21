@@ -5,7 +5,8 @@ use crate::{Umem, libc, slab::Slab};
 
 /// Ring from which we can dequeue packets that have been filled by the kernel
 pub struct RxRing {
-    ring: super::XskConsumer<libc::xdp::xdp_desc>,
+    #[allow(missing_docs)]
+    pub ring: super::XskConsumer<libc::xdp::xdp_desc>,
     _mmap: crate::mmap::Mmap,
 }
 
@@ -48,7 +49,7 @@ impl RxRing {
     ///
     /// The packets returned in the slab must not outlive the [`Umem`]
     #[inline]
-    pub unsafe fn recv<S: Slab>(&mut self, umem: &Umem, packets: &mut S) -> usize {
+    pub unsafe fn recv<S: Slab>(&mut self, umem: &mut Umem, packets: &mut S) -> usize {
         let nb = packets.available();
         if nb == 0 {
             return 0;
@@ -64,6 +65,7 @@ impl RxRing {
                     // packets we are returning
                     unsafe { umem.packet(desc) },
                 );
+                umem.free_addr(desc.addr);
             }
 
             self.ring.release(actual as _);

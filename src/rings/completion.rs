@@ -1,11 +1,12 @@
 //! The [`CompletionRing`] is a consumer ring that userspace can dequeue packets
 //! that have been sent on the NIC queue the ring is bound to
 
-use crate::{Umem, libc::rings};
+use crate::{libc::{self, rings}, slab::Slab, Umem};
 
 /// The ring used to dequeue buffers that the kernel has finished sending
 pub struct CompletionRing {
-    ring: super::XskConsumer<u64>,
+    #[allow(missing_docs)]
+    pub ring: super::XskConsumer<libc::xdp::xdp_desc>,
     _mmap: crate::mmap::Mmap,
 }
 
@@ -40,19 +41,23 @@ impl CompletionRing {
     /// # Returns
     ///
     /// The number of packets that were actually dequeued.
-    pub fn dequeue(&mut self, umem: &mut Umem, num_packets: usize) -> usize {
-        let requested = num_packets;
-        if requested == 0 {
+    pub fn dequeue<S: Slab>(&mut self, umem: &mut Umem, packets: &mut S) -> usize {
+        let nb = packets.available();
+        if nb == 0 {
             return 0;
         }
 
-        let (actual, idx) = self.ring.peek(requested as _);
+        let (actual, idx) = self.ring.peek(nb as _);
 
         if actual > 0 {
             for i in idx..idx + actual {
-                // SAFETY: The mask ensures the index is always within range
-                let addr = self.ring.get(i);
-                umem.free_addr(addr);
+                let desc = self.ring.get(i);
+                packets.push_front(
+                    // SAFETY: The user is responsible for the lifetime of the
+                    // packets we are returning
+                    unsafe { umem.packet(desc) },
+                );
+                umem.free_addr(desc.addr);
             }
 
             self.ring.release(actual as _);
@@ -65,18 +70,23 @@ impl CompletionRing {
     /// transmitted is written to the provided slice.
     ///
     /// Note this requires that [`crate::Packet::set_tx_metadata`] was called
-    pub fn dequeue_with_timestamps(&mut self, umem: &mut Umem, timestamps: &mut [u64]) -> usize {
-        let requested = timestamps.len();
-        if requested == 0 {
+    pub fn dequeue_with_timestamps<S: Slab>(&mut self, umem: &mut Umem, packets: &mut S, timestamps: &mut [u64]) -> usize {
+        let nb = packets.available();
+        if nb == 0 {
             return 0;
         }
 
-        let (actual, idx) = self.ring.peek(requested as _);
+        let (actual, idx) = self.ring.peek(nb as _);
 
         if actual > 0 {
             for (ts, i) in timestamps.iter_mut().zip(idx..idx + actual) {
-                let addr = self.ring.get(i);
-                *ts = umem.free_get_timestamp(addr);
+                let desc = self.ring.get(i);
+                packets.push_front(
+                    // SAFETY: The user is responsible for the lifetime of the
+                    // packets we are returning
+                    unsafe { umem.packet(desc) },
+                );
+                *ts = umem.free_get_timestamp(desc.addr);
             }
 
             self.ring.release(actual as _);
